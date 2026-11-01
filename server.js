@@ -41,7 +41,8 @@ bot.launch().then(() => console.log('🤖 Бот запущен!'));
 
 app.get('/api/updates', (req, res) => {
   res.json(latestUpdates);
-  latestUpdates = [];
+  // Сразу очищаем массив, чтобы фронтенд не прочитал одно и то же событие дважды
+  latestUpdates = []; 
 });
 
 const PORT = process.env.PORT || 3000;
