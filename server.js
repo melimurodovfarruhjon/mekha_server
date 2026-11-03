@@ -91,6 +91,117 @@ ADD COLUMN IF NOT EXISTS frontend_processed_at TIMESTAMPTZ;
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
+    
+-- =========================================
+-- MEKHA SHOP: PROCUREMENT AND INVENTORY
+-- =========================================
+
+CREATE TABLE IF NOT EXISTS products (
+  id UUID PRIMARY KEY,
+  legacy_id TEXT UNIQUE,
+  title TEXT NOT NULL,
+  photo TEXT,
+  is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS purchase_batches (
+  id UUID PRIMARY KEY,
+  batch_number BIGINT GENERATED ALWAYS AS IDENTITY UNIQUE,
+  purchased_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  notes TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS purchase_batch_items (
+  id UUID PRIMARY KEY,
+  batch_id UUID NOT NULL REFERENCES purchase_batches(id),
+  product_id UUID NOT NULL REFERENCES products(id),
+
+  initial_quantity INTEGER NOT NULL CHECK (initial_quantity > 0),
+
+  wholesale_amount NUMERIC(14,2) NOT NULL CHECK (wholesale_amount >= 0),
+  wholesale_currency CHAR(3) NOT NULL,
+  wholesale_rate_to_tjs NUMERIC(14,6) NOT NULL CHECK (wholesale_rate_to_tjs > 0),
+  wholesale_total_tjs NUMERIC(14,2) NOT NULL CHECK (wholesale_total_tjs >= 0),
+
+  cargo_amount NUMERIC(14,2) NOT NULL CHECK (cargo_amount >= 0),
+  cargo_currency CHAR(3) NOT NULL,
+  cargo_rate_to_tjs NUMERIC(14,6) NOT NULL CHECK (cargo_rate_to_tjs > 0),
+  cargo_total_tjs NUMERIC(14,2) NOT NULL CHECK (cargo_total_tjs >= 0),
+
+  unit_cost_tjs NUMERIC(14,4) NOT NULL CHECK (unit_cost_tjs >= 0),
+  current_sale_price_tjs NUMERIC(14,2) NOT NULL DEFAULT 0
+    CHECK (current_sale_price_tjs >= 0),
+
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+  UNIQUE (batch_id, product_id)
+);
+
+CREATE TABLE IF NOT EXISTS purchase_batch_item_variants (
+  id UUID PRIMARY KEY,
+  batch_item_id UUID NOT NULL
+    REFERENCES purchase_batch_items(id),
+
+  color_name TEXT NOT NULL DEFAULT 'Без цвета',
+  size_name TEXT NOT NULL DEFAULT 'Без размера',
+
+  initial_quantity INTEGER NOT NULL CHECK (initial_quantity >= 0),
+  reserved_quantity INTEGER NOT NULL DEFAULT 0 CHECK (reserved_quantity >= 0),
+  sold_quantity INTEGER NOT NULL DEFAULT 0 CHECK (sold_quantity >= 0),
+
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+  CHECK (reserved_quantity + sold_quantity <= initial_quantity),
+
+  UNIQUE (batch_item_id, color_name, size_name)
+);
+
+CREATE TABLE IF NOT EXISTS sales (
+  id UUID PRIMARY KEY,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  comment TEXT
+);
+
+CREATE TABLE IF NOT EXISTS sale_items (
+  id UUID PRIMARY KEY,
+  sale_id UUID NOT NULL REFERENCES sales(id),
+  product_id UUID NOT NULL REFERENCES products(id),
+
+  title_snapshot TEXT NOT NULL,
+  color_name TEXT NOT NULL,
+  size_name TEXT NOT NULL,
+
+  quantity INTEGER NOT NULL CHECK (quantity > 0),
+  unit_sale_price_tjs NUMERIC(14,2) NOT NULL CHECK (unit_sale_price_tjs >= 0),
+  unit_cost_tjs NUMERIC(14,4) NOT NULL CHECK (unit_cost_tjs >= 0),
+
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS inventory_allocations (
+  id BIGSERIAL PRIMARY KEY,
+  sale_item_id UUID NOT NULL REFERENCES sale_items(id),
+  variant_id UUID NOT NULL REFERENCES purchase_batch_item_variants(id),
+  quantity INTEGER NOT NULL CHECK (quantity > 0),
+  unit_cost_tjs NUMERIC(14,4) NOT NULL CHECK (unit_cost_tjs >= 0),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_purchase_batch_items_product
+  ON purchase_batch_items(product_id);
+
+CREATE INDEX IF NOT EXISTS idx_purchase_batches_date
+  ON purchase_batches(purchased_at);
+
+CREATE INDEX IF NOT EXISTS idx_inventory_variants_fifo
+  ON purchase_batch_item_variants(batch_item_id, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_inventory_allocations_variant
+  ON inventory_allocations(variant_id);
+
+
     CREATE INDEX IF NOT EXISTS idx_order_items_order_id
       ON order_items(order_id);
 
