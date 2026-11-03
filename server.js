@@ -117,7 +117,8 @@ app.get('/api/db-health', async (req, res) => {
   }
 });
 
-// Создание заказа и сохранение в PostgreSQL
+
+// Создание заказа, сохранение в PostgreSQL и отправка курьеру
 app.post('/api/orders', async (req, res) => {
   const {
     courierName,
@@ -194,25 +195,69 @@ app.post('/api/orders', async (req, res) => {
     }
 
     await client.query('COMMIT');
-
-    return res.status(201).json({
-      success: true,
-      orderId,
-      status: 'pending',
-      message: 'Заказ сохранён в PostgreSQL'
-    });
-
   } catch (error) {
     await client.query('ROLLBACK');
-
     console.error('Order creation error:', error.message);
 
     return res.status(500).json({
       error: 'Не удалось сохранить заказ'
     });
-
   } finally {
     client.release();
+  }
+
+  const itemsText = items
+    .map(item => `• ${item.title} — ${Number(item.qty)} шт.`)
+    .join('\n');
+
+  const messageText =
+    `📦 НОВЫЙ ЗАКАЗ НА ДОСТАВКУ!\n\n` +
+    `🆔 Заказ: ${orderId}\n\n` +
+    `🛍 Товары:\n${itemsText}\n\n` +
+    `📍 Адрес: ${clientAddress || 'Не указан'}\n` +
+    `📞 Телефон: ${clientPhone || 'Не указан'}\n` +
+    `${comment ? `💬 Комментарий: ${comment}\n` : ''}\n` +
+    `Пожалуйста, подтвердите статус кнопкой ниже.`;
+
+  try {
+    const telegramMessage = await bot.telegram.sendMessage(
+      String(courierChatId),
+      messageText,
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              {
+                text: '✅ Доставлено',
+                callback_data: `delivered:${orderId}`
+              },
+              {
+                text: '⚠️ Возврат',
+                callback_data: `return:${orderId}`
+              }
+            ]
+          ]
+        }
+      }
+    );
+
+    return res.status(201).json({
+      success: true,
+      orderId,
+      status: 'pending',
+      telegramMessageId: telegramMessage.message_id,
+      message: 'Заказ сохранён и отправлен курьеру'
+    });
+
+  } catch (error) {
+    console.error('Telegram send error:', error.message);
+
+    return res.status(502).json({
+      success: false,
+      orderId,
+      saved: true,
+      error: 'Заказ сохранён в базе, но Telegram не смог отправить сообщение'
+    });
   }
 });
 
