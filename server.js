@@ -61,18 +61,21 @@ async function initializeDatabase() {
       photo TEXT
     );
 
-    CREATE TABLE IF NOT EXISTS order_events (
-      ALTER TABLE order_events
-      ADD COLUMN IF NOT EXISTS frontend_processed_at TIMESTAMPTZ;
-      id BIGSERIAL PRIMARY KEY,
-      order_id UUID NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
-      event_type TEXT NOT NULL CHECK (
-        event_type IN ('DELIVERED', 'RETURN')
-      ),
-      reason TEXT,
-      telegram_callback_id TEXT UNIQUE,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
+    
+CREATE TABLE IF NOT EXISTS order_events (
+  id BIGSERIAL PRIMARY KEY,
+  order_id UUID NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+  event_type TEXT NOT NULL CHECK (
+    event_type IN ('DELIVERED', 'RETURN')
+  ),
+  reason TEXT,
+  telegram_callback_id TEXT UNIQUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+ALTER TABLE order_events
+ADD COLUMN IF NOT EXISTS frontend_processed_at TIMESTAMPTZ;
+
 
     CREATE TABLE IF NOT EXISTS push_subscriptions (
       id BIGSERIAL PRIMARY KEY,
@@ -377,11 +380,6 @@ bot.on('callback_query', async (ctx) => {
         client.release();
       }
 
-      latestUpdates.unshift({
-        orderId,
-        time: new Date().toLocaleTimeString()
-      });
-
       await ctx.answerCbQuery('Заказ отмечен как доставленный');
       await ctx.editMessageText(
         '✅ Заказ успешно доставлен клиенту.'
@@ -480,13 +478,6 @@ bot.on('text', async (ctx) => {
       await ctx.reply('Этот ответ уже был обработан.');
       return;
     }
-
-    latestUpdates.unshift({
-      orderId,
-      type: 'RETURN',
-      reason: reasonText,
-      time: new Date().toLocaleTimeString()
-    });
 
     await ctx.reply(
       '✅ Причина возврата сохранена. Менеджер получит уведомление.'
