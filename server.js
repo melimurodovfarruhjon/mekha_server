@@ -52,6 +52,13 @@ async function initializeDatabase() {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
+      ALTER TABLE orders
+      ADD COLUMN IF NOT EXISTS public_number SMALLINT;
+      
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_active_public_number
+      ON orders(public_number)
+      WHERE status = 'pending';
+
     CREATE TABLE IF NOT EXISTS order_items (
       id BIGSERIAL PRIMARY KEY,
       order_id UUID NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
