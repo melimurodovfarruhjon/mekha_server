@@ -3,7 +3,12 @@ const express = require('express');
 const cors = require('cors');
 const webpush = require('web-push');
 
-const TOKEN = process.env.BOT_TOKEN || "9001028588:AAG1_dp-LI9C3TdDw9OhuH3Lw_zf4YVKnwA";
+const TOKEN = process.env.BOT_TOKEN;
+
+if (!TOKEN) {
+  throw new Error('BOT_TOKEN is not configured');
+}
+
 const bot = new Telegraf(TOKEN);
 const app = express();
 
@@ -11,8 +16,12 @@ app.use(cors());
 app.use(express.json());
 
 // VAPID keys for Web Push (Render environment variables-raas fudhachuu dandeessa)
-const publicVapidKey = process.env.VAPID_PUBLIC_KEY || 'BPXRyIcZnEdu1ErcZBkaoOABUtoWP2zihwovQbzq2KRAFbpPuGSPNt2rA0E0RkIPl3Ip0g1kUjIq1YnrNlYLaA8';
-const privateVapidKey = process.env.VAPID_PRIVATE_KEY || 'f1ceehHZVS6eYCrJKyMbfYVE2xKUkdeAEiYnRY-J2_0';
+const publicVapidKey = process.env.VAPID_PUBLIC_KEY;
+const privateVapidKey = process.env.VAPID_PRIVATE_KEY;
+
+if (!publicVapidKey || !privateVapidKey) {
+  throw new Error('VAPID keys are not configured');
+}
 
 webpush.setVapidDetails(
   'mailto:example@yourdomain.com',
