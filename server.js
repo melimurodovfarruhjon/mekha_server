@@ -24,6 +24,58 @@ const pool = new Pool({
   connectionTimeoutMillis: 5000
 });
 
+async function initializeDatabase() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS orders (
+      id UUID PRIMARY KEY,
+      courier_name TEXT NOT NULL,
+      courier_chat_id TEXT NOT NULL,
+      client_phone TEXT,
+      client_address TEXT,
+      comment TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      return_reason TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS order_items (
+      id BIGSERIAL PRIMARY KEY,
+      order_id UUID NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+      product_id TEXT,
+      title TEXT NOT NULL,
+      quantity INTEGER NOT NULL CHECK (quantity > 0),
+      photo TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS order_events (
+      id BIGSERIAL PRIMARY KEY,
+      order_id UUID NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+      event_type TEXT NOT NULL CHECK (
+        event_type IN ('DELIVERED', 'RETURN')
+      ),
+      reason TEXT,
+      telegram_callback_id TEXT UNIQUE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS push_subscriptions (
+      id BIGSERIAL PRIMARY KEY,
+      endpoint TEXT NOT NULL UNIQUE,
+      subscription JSONB NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_order_items_order_id
+      ON order_items(order_id);
+
+    CREATE INDEX IF NOT EXISTS idx_order_events_order_id
+      ON order_events(order_id);
+  `);
+
+  console.log('PostgreSQL tables initialized successfully');
+}
+
 app.use(cors());
 app.use(express.json());
 
@@ -117,12 +169,27 @@ bot.on('text', async (ctx) => {
   }
 });
 
-bot.launch().then(() => console.log('🤖 Бот запущен!'));
-
 app.get('/api/updates', (req, res) => {
   res.json(latestUpdates);
-  latestUpdates = []; 
+  latestUpdates = [];
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🌐 Сервер работает на порту ${PORT}`));
+
+async function startServer() {
+  try {
+    await initializeDatabase();
+
+    await bot.launch();
+    console.log('🤖 Бот запущен!');
+
+    app.listen(PORT, () => {
+      console.log(`🌐 Сервер работает на порту ${PORT}`);
+    });
+  } catch (error) {
+    console.error('Server startup failed:', error);
+    process.exit(1);
+  }
+}
+
+startServer();
