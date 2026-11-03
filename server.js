@@ -62,6 +62,8 @@ async function initializeDatabase() {
     );
 
     CREATE TABLE IF NOT EXISTS order_events (
+      ALTER TABLE order_events
+      ADD COLUMN IF NOT EXISTS frontend_processed_at TIMESTAMPTZ;
       id BIGSERIAL PRIMARY KEY,
       order_id UUID NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
       event_type TEXT NOT NULL CHECK (
@@ -299,7 +301,6 @@ async function sendPushNotification(title, body) {
 
 
 const waitingForReason = new Map();
-let latestUpdates = [];
 
 // Проверка принадлежности заказа курьеру
 async function getCourierOrder(orderId, chatId) {
@@ -378,7 +379,6 @@ bot.on('callback_query', async (ctx) => {
 
       latestUpdates.unshift({
         orderId,
-        type: 'DELIVERED',
         time: new Date().toLocaleTimeString()
       });
 
@@ -509,10 +509,68 @@ bot.on('text', async (ctx) => {
   }
 });
 
-// Передача обновлений frontend
-app.get('/api/updates', (req, res) => {
-  res.json(latestUpdates);
-  latestUpdates = [];
+
+// Получение необработанных событий из PostgreSQL
+app.get('/api/updates', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT
+        id,
+        order_id AS "orderId",
+        event_type AS type,
+        reason,
+        created_at AS "createdAt"
+       FROM order_events
+       WHERE frontend_processed_at IS NULL
+       ORDER BY id ASC
+       LIMIT 100`
+    );
+
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Updates fetch error:', error.message);
+    res.status(500).json({
+      error: 'Не удалось получить обновления'
+    });
+  }
+});
+
+// Подтверждение обработки событий frontend
+app.post('/api/updates/ack', async (req, res) => {
+  const { eventIds } = req.body;
+
+  if (
+    !Array.isArray(eventIds) ||
+    eventIds.length === 0 ||
+    eventIds.length > 100 ||
+    !eventIds.every(id => Number.isInteger(id) && id > 0)
+  ) {
+    return res.status(400).json({
+      error: 'Некорректные ID событий'
+    });
+  }
+
+  try {
+    const result = await pool.query(
+      `UPDATE order_events
+       SET frontend_processed_at = NOW()
+       WHERE id = ANY($1::bigint[])
+       AND frontend_processed_at IS NULL
+       RETURNING id`,
+      [eventIds]
+    );
+
+    res.json({
+      success: true,
+      acknowledged: result.rowCount
+    });
+  } catch (error) {
+    console.error('Updates acknowledgement error:', error.message);
+
+    res.status(500).json({
+      error: 'Не удалось подтвердить обновления'
+    });
+  }
 });
 
 const PORT = process.env.PORT || 3000;
