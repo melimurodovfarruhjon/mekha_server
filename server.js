@@ -170,19 +170,52 @@ app.post('/api/orders', async (req, res) => {
     });
   }
 
-  const client = await pool.connect();
-  const orderId = randomUUID();
+  
+const client = await pool.connect();
+const orderId = randomUUID();
+let publicNumber;
 
-  try {
-    await client.query('BEGIN');
+try {
+  await client.query('BEGIN');
+
+  // Не допускаем одновременную выдачу одинаковых номеров
+  await client.query(
+    'SELECT pg_advisory_xact_lock(497001)'
+  );
+
+  // Ищем свободный трёхзначный номер
+  const numberResult = await client.query(
+    `SELECT candidate AS public_number
+     FROM generate_series(100, 999) AS candidate
+     WHERE NOT EXISTS (
+       SELECT 1
+       FROM orders
+       WHERE public_number = candidate
+       AND status = 'pending'
+     )
+     ORDER BY candidate
+     LIMIT 1`
+  );
+
+  if (numberResult.rowCount === 0) {
+    await client.query('ROLLBACK');
+
+    return res.status(409).json({
+      error: 'Все трёхзначные номера заказов заняты'
+    });
+  }
+
+  publicNumber = numberResult.rows[0].public_number;
+
 
     await client.query(
       `INSERT INTO orders (
-        id, courier_name, courier_chat_id,
-        client_phone, client_address, comment
-      ) VALUES ($1, $2, $3, $4, $5, $6)`,
+       id, public_number, courier_name, courier_chat_id,
+       client_phone, client_address, comment
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
       [
         orderId,
+        publicNumber,
         courierName.trim(),
         String(courierChatId),
         clientPhone || null,
@@ -224,7 +257,7 @@ app.post('/api/orders', async (req, res) => {
 
   const messageText =
     `📦 НОВЫЙ ЗАКАЗ НА ДОСТАВКУ!\n\n` +
-    `🆔 Заказ: ${orderId}\n\n` +
+    `🆔 Номер заказа: ${publicNumber}\n\n` +
     `🛍 Товары:\n${itemsText}\n\n` +
     `📍 Адрес: ${clientAddress || 'Не указан'}\n` +
     `📞 Телефон: ${clientPhone || 'Не указан'}\n` +
@@ -256,6 +289,7 @@ app.post('/api/orders', async (req, res) => {
     return res.status(201).json({
       success: true,
       orderId,
+      publicNumber,
       status: 'pending',
       telegramMessageId: telegramMessage.message_id,
       message: 'Заказ сохранён и отправлен курьеру'
