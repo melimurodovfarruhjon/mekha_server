@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const webpush = require('web-push');
 const { Pool } = require('pg');
+const { randomUUID } = require('crypto');
 
 const TOKEN = process.env.BOT_TOKEN;
 
@@ -113,6 +114,105 @@ app.get('/api/db-health', async (req, res) => {
       status: 'error',
       database: 'disconnected'
     });
+  }
+});
+
+// Создание заказа и сохранение в PostgreSQL
+app.post('/api/orders', async (req, res) => {
+  const {
+    courierName,
+    courierChatId,
+    clientPhone,
+    clientAddress,
+    comment,
+    items
+  } = req.body;
+
+  if (
+    typeof courierName !== 'string' ||
+    !courierName.trim() ||
+    !courierChatId ||
+    !Array.isArray(items) ||
+    items.length === 0 ||
+    items.length > 100
+  ) {
+    return res.status(400).json({
+      error: 'Некорректные данные заказа'
+    });
+  }
+
+  const validItems = items.every(item =>
+    item &&
+    typeof item.title === 'string' &&
+    item.title.trim().length > 0 &&
+    item.title.length <= 250 &&
+    Number.isInteger(Number(item.qty)) &&
+    Number(item.qty) > 0 &&
+    Number(item.qty) <= 10000
+  );
+
+  if (!validItems) {
+    return res.status(400).json({
+      error: 'Некорректный состав заказа'
+    });
+  }
+
+  const client = await pool.connect();
+  const orderId = randomUUID();
+
+  try {
+    await client.query('BEGIN');
+
+    await client.query(
+      `INSERT INTO orders (
+        id, courier_name, courier_chat_id,
+        client_phone, client_address, comment
+      ) VALUES ($1, $2, $3, $4, $5, $6)`,
+      [
+        orderId,
+        courierName.trim(),
+        String(courierChatId),
+        clientPhone || null,
+        clientAddress || null,
+        comment || null
+      ]
+    );
+
+    for (const item of items) {
+      await client.query(
+        `INSERT INTO order_items (
+          order_id, product_id, title, quantity, photo
+        ) VALUES ($1, $2, $3, $4, $5)`,
+        [
+          orderId,
+          item.productId ? String(item.productId) : null,
+          item.title.trim(),
+          Number(item.qty),
+          item.photo || null
+        ]
+      );
+    }
+
+    await client.query('COMMIT');
+
+    return res.status(201).json({
+      success: true,
+      orderId,
+      status: 'pending',
+      message: 'Заказ сохранён в PostgreSQL'
+    });
+
+  } catch (error) {
+    await client.query('ROLLBACK');
+
+    console.error('Order creation error:', error.message);
+
+    return res.status(500).json({
+      error: 'Не удалось сохранить заказ'
+    });
+
+  } finally {
+    client.release();
   }
 });
 
