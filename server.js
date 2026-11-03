@@ -297,41 +297,219 @@ async function sendPushNotification(title, body) {
   }
 }
 
+
 const waitingForReason = new Map();
 let latestUpdates = [];
 
+// Проверка принадлежности заказа курьеру
+async function getCourierOrder(orderId, chatId) {
+  const result = await pool.query(
+    `SELECT id, status
+     FROM orders
+     WHERE id = $1 AND courier_chat_id = $2`,
+    [orderId, String(chatId)]
+  );
+
+  return result.rows[0] || null;
+}
+
+// Обработка кнопок Telegram
 bot.on('callback_query', async (ctx) => {
-  const data = ctx.callbackQuery.data;
+  const data = ctx.callbackQuery.data || '';
   const chatId = ctx.chat.id;
 
-  if (data === 'delivered') {
-    await ctx.answerCbQuery('Заказ отмечен как доставленный!');
-    await ctx.editMessageText('✅ Заказ успешно доставлен клиенту.');
-    latestUpdates.unshift({ type: 'DELIVERED', time: new Date().toLocaleTimeString() });
-    
-    // Bilbifataaf / App-ichaaf Push notification erguu
-    await sendPushNotification("Заказ доставлен! 🎉", "Курьер успешно доставил заказ клиенту.");
+  try {
+    const [action, orderId] = data.split(':');
 
-  } else if (data === 'other') {
-    waitingForReason.set(chatId, true);
-    await ctx.answerCbQuery();
-    await ctx.reply('⚠️ Пожалуйста, напишите причину (например, возврат или отказ) ответным сообщением в этот чат:');
+    if (!orderId || !['delivered', 'return'].includes(action)) {
+      await ctx.answerCbQuery('Неизвестная команда');
+      return;
+    }
+
+    const order = await getCourierOrder(orderId, chatId);
+
+    if (!order) {
+      await ctx.answerCbQuery('Заказ не найден или не принадлежит вам');
+      return;
+    }
+
+    if (order.status !== 'pending') {
+      await ctx.answerCbQuery('Этот заказ уже обработан');
+      return;
+    }
+
+    if (action === 'delivered') {
+      const client = await pool.connect();
+
+      try {
+        await client.query('BEGIN');
+
+        const event = await client.query(
+          `INSERT INTO order_events (
+            order_id, event_type, telegram_callback_id
+          )
+          VALUES ($1, 'DELIVERED', $2)
+          ON CONFLICT (telegram_callback_id) DO NOTHING
+          RETURNING id`,
+          [orderId, String(ctx.callbackQuery.id)]
+        );
+
+        if (event.rowCount > 0) {
+          await client.query(
+            `UPDATE orders
+             SET status = 'delivered', updated_at = NOW()
+             WHERE id = $1 AND status = 'pending'`,
+            [orderId]
+          );
+        }
+
+        await client.query('COMMIT');
+
+        if (event.rowCount === 0) {
+          await ctx.answerCbQuery('Этот ответ уже обработан');
+          return;
+        }
+      } catch (error) {
+        await client.query('ROLLBACK');
+        throw error;
+      } finally {
+        client.release();
+      }
+
+      latestUpdates.unshift({
+        orderId,
+        type: 'DELIVERED',
+        time: new Date().toLocaleTimeString()
+      });
+
+      await ctx.answerCbQuery('Заказ отмечен как доставленный');
+      await ctx.editMessageText(
+        '✅ Заказ успешно доставлен клиенту.'
+      );
+
+      await sendPushNotification(
+        'Заказ доставлен!',
+        'Курьер успешно доставил заказ клиенту.'
+      );
+
+    } else if (action === 'return') {
+      waitingForReason.set(String(chatId), orderId);
+
+      await ctx.answerCbQuery();
+      await ctx.reply(
+        '⚠️ Напишите причину возврата ответным сообщением в этот чат.'
+      );
+    }
+
+  } catch (error) {
+    console.error('Telegram callback error:', error.message);
+
+    try {
+      await ctx.answerCbQuery('Ошибка обработки. Попробуйте позже.');
+    } catch (_) {}
   }
 });
 
+// Получение причины возврата
 bot.on('text', async (ctx) => {
-  const chatId = ctx.chat.id;
-  if (waitingForReason.has(chatId)) {
-    const reasonText = ctx.message.text;
-    waitingForReason.delete(chatId);
-    await ctx.reply(`✅ Причина принята: «${reasonText}». Менеджер получил уведомление.`);
-    latestUpdates.unshift({ type: 'RETURN', reason: reasonText, time: new Date().toLocaleTimeString() });
+  const chatId = String(ctx.chat.id);
+  const orderId = waitingForReason.get(chatId);
 
-    // Push notification erguu (Возврат)
-    await sendPushNotification("Внимание: Возврат ⚠️", `Причина: ${reasonText}`);
+  if (!orderId) return;
+
+  const reasonText = ctx.message.text.trim();
+
+  if (!reasonText || reasonText.length > 1000) {
+    await ctx.reply(
+      'Причина должна содержать от 1 до 1000 символов.'
+    );
+    return;
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    const order = await client.query(
+      `SELECT id, status
+       FROM orders
+       WHERE id = $1 AND courier_chat_id = $2
+       FOR UPDATE`,
+      [orderId, chatId]
+    );
+
+    if (!order.rows[0] || order.rows[0].status !== 'pending') {
+      await client.query('ROLLBACK');
+      waitingForReason.delete(chatId);
+
+      await ctx.reply('Заказ не найден или уже обработан.');
+      return;
+    }
+
+    const event = await client.query(
+      `INSERT INTO order_events (
+        order_id, event_type, reason, telegram_callback_id
+      )
+      VALUES ($1, 'RETURN', $2, $3)
+      ON CONFLICT (telegram_callback_id) DO NOTHING
+      RETURNING id`,
+      [
+        orderId,
+        reasonText,
+        `message:${ctx.message.message_id}`
+      ]
+    );
+
+    if (event.rowCount > 0) {
+      await client.query(
+        `UPDATE orders
+         SET status = 'returned',
+             return_reason = $2,
+             updated_at = NOW()
+         WHERE id = $1`,
+        [orderId, reasonText]
+      );
+    }
+
+    await client.query('COMMIT');
+
+    waitingForReason.delete(chatId);
+
+    if (event.rowCount === 0) {
+      await ctx.reply('Этот ответ уже был обработан.');
+      return;
+    }
+
+    latestUpdates.unshift({
+      orderId,
+      type: 'RETURN',
+      reason: reasonText,
+      time: new Date().toLocaleTimeString()
+    });
+
+    await ctx.reply(
+      '✅ Причина возврата сохранена. Менеджер получит уведомление.'
+    );
+
+    await sendPushNotification(
+      'Внимание: возврат',
+      `Причина: ${reasonText}`
+    );
+
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Return processing error:', error.message);
+
+    await ctx.reply(
+      'Не удалось сохранить причину. Попробуйте ещё раз.'
+    );
+  } finally {
+    client.release();
   }
 });
 
+// Передача обновлений frontend
 app.get('/api/updates', (req, res) => {
   res.json(latestUpdates);
   latestUpdates = [];
