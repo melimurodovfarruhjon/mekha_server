@@ -13,6 +13,18 @@ if (!TOKEN) {
 const bot = new Telegraf(TOKEN);
 const app = express();
 
+const WEBHOOK_URL = process.env.WEBHOOK_URL;
+const WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET;
+const WEBHOOK_PATH = '/telegram/webhook';
+
+if (!WEBHOOK_URL || !WEBHOOK_SECRET) {
+  throw new Error('Webhook environment variables are not configured');
+}
+
+if (!/^[A-Za-z0-9_-]{1,256}$/.test(WEBHOOK_SECRET)) {
+  throw new Error('Invalid Telegram webhook secret format');
+}
+
 if (!process.env.DATABASE_URL) {
   throw new Error('DATABASE_URL is not configured');
 }
@@ -78,6 +90,12 @@ async function initializeDatabase() {
 
 app.use(cors());
 app.use(express.json());
+
+app.use(
+  bot.webhookCallback(WEBHOOK_PATH, {
+    secretToken: WEBHOOK_SECRET
+  })
+);
 
 app.get('/api/db-health', async (req, res) => {
   try {
@@ -180,11 +198,22 @@ async function startServer() {
   try {
     await initializeDatabase();
 
-    await bot.launch();
-    console.log('🤖 Бот запущен!');
-
-    app.listen(PORT, () => {
+    app.listen(PORT, async () => {
       console.log(`🌐 Сервер работает на порту ${PORT}`);
+
+      try {
+        const webhookAddress =
+          `${WEBHOOK_URL.replace(/\/$/, '')}${WEBHOOK_PATH}`;
+
+        await bot.telegram.setWebhook(webhookAddress, {
+          secret_token: WEBHOOK_SECRET,
+          allowed_updates: ['message', 'callback_query']
+        });
+
+        console.log('🤖 Telegram Webhook успешно установлен!');
+      } catch (error) {
+        console.error('Telegram Webhook setup failed:', error.message);
+      }
     });
   } catch (error) {
     console.error('Server startup failed:', error);
