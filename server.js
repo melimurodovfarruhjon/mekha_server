@@ -242,7 +242,319 @@ app.get('/api/db-health', async (req, res) => {
 
 
 // Создание заказа, сохранение в PostgreSQL и отправка курьеру
-app.post('/api/orders', async (req, res) => {
+
+// =========================================
+// MEKHA SHOP: CREATE PURCHASE BATCH
+// =========================================
+
+app.post('/api/purchase-batches', async (req, res) => {
+  const { items, notes } = req.body;
+
+  if (
+    !Array.isArray(items) ||
+    items.length === 0 ||
+    items.length > 100
+  ) {
+    return res.status(400).json({
+      error: 'Партия должна содержать от 1 до 100 позиций'
+    });
+  }
+
+  if (notes != null && (
+    typeof notes !== 'string' || notes.length > 1000
+  )) {
+    return res.status(400).json({
+      error: 'Некорректное примечание'
+    });
+  }
+
+  const allowedCurrencies = ['TJS', 'USD', 'CNY'];
+
+  const round = (value, digits = 2) => {
+    const factor = 10 ** digits;
+    return Math.round((value + Number.EPSILON) * factor) / factor;
+  };
+
+  const seenProducts = new Set();
+
+  for (const item of items) {
+    if (
+      !item ||
+      typeof item.title !== 'string' ||
+      !item.title.trim() ||
+      item.title.length > 250
+    ) {
+      return res.status(400).json({
+        error: 'У каждой позиции должно быть название'
+      });
+    }
+
+    if (
+      !Number.isInteger(Number(item.quantity)) ||
+      Number(item.quantity) <= 0 ||
+      Number(item.quantity) > 100000
+    ) {
+      return res.status(400).json({
+        error: `Некорректное количество товара: ${item.title}`
+      });
+    }
+
+    if (
+      !allowedCurrencies.includes(item.wholesaleCurrency) ||
+      !allowedCurrencies.includes(item.cargoCurrency)
+    ) {
+      return res.status(400).json({
+        error: 'Поддерживаются валюты TJS, USD и CNY'
+      });
+    }
+
+    const numericFields = [
+      item.wholesaleAmount,
+      item.wholesaleRateToTjs,
+      item.cargoAmount,
+      item.cargoRateToTjs,
+      item.salePriceTjs
+    ];
+
+    if (!numericFields.every(value =>
+      value !== null &&
+      value !== undefined &&
+      Number.isFinite(Number(value))
+    )) {
+      return res.status(400).json({
+        error: `Некорректные финансовые данные: ${item.title}`
+      });
+    }
+
+    if (
+      Number(item.wholesaleAmount) < 0 ||
+      Number(item.cargoAmount) < 0 ||
+      Number(item.salePriceTjs) < 0 ||
+      Number(item.wholesaleRateToTjs) <= 0 ||
+      Number(item.cargoRateToTjs) <= 0
+    ) {
+      return res.status(400).json({
+        error: `Недопустимые суммы или курсы: ${item.title}`
+      });
+    }
+
+    if (
+      !Array.isArray(item.variants) ||
+      item.variants.length === 0
+    ) {
+      return res.status(400).json({
+        error: `Укажите цвета и размеры: ${item.title}`
+      });
+    }
+
+    let variantsTotal = 0;
+    const seenVariants = new Set();
+
+    for (const variant of item.variants) {
+      const color = String(variant.color || '').trim();
+      const size = String(variant.size || '').trim();
+      const quantity = Number(variant.quantity);
+
+      if (
+        !color ||
+        !size ||
+        color.length > 80 ||
+        size.length > 40 ||
+        !Number.isInteger(quantity) ||
+        quantity < 0
+      ) {
+        return res.status(400).json({
+          error: `Некорректный вариант товара: ${item.title}`
+        });
+      }
+
+      const variantKey = `${color.toLowerCase()}|${size.toLowerCase()}`;
+
+      if (seenVariants.has(variantKey)) {
+        return res.status(400).json({
+          error: `Повторяется вариант ${color} / ${size}`
+        });
+      }
+
+      seenVariants.add(variantKey);
+      variantsTotal += quantity;
+    }
+
+    if (variantsTotal !== Number(item.quantity)) {
+      return res.status(400).json({
+        error: `Сумма вариантов товара "${item.title}" (${variantsTotal}) не совпадает с общим количеством (${item.quantity})`
+      });
+    }
+
+    const legacyId = item.legacyId == null
+      ? null
+      : String(item.legacyId);
+
+    if (legacyId && seenProducts.has(legacyId)) {
+      return res.status(400).json({
+        error: `Товар "${item.title}" повторяется в партии`
+      });
+    }
+
+    if (legacyId) seenProducts.add(legacyId);
+  }
+
+  const client = await pool.connect();
+  const batchId = randomUUID();
+
+  try {
+    await client.query('BEGIN');
+
+    const batchResult = await client.query(
+      `INSERT INTO purchase_batches (id, notes)
+       VALUES ($1, $2)
+       RETURNING batch_number, purchased_at`,
+      [batchId, notes?.trim() || null]
+    );
+
+    const savedItems = [];
+
+    for (const item of items) {
+      const productId = randomUUID();
+      const legacyId = item.legacyId == null
+        ? null
+        : String(item.legacyId);
+
+      const productResult = await client.query(
+        `INSERT INTO products (
+          id, legacy_id, title, photo
+        )
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (legacy_id)
+        DO UPDATE SET
+          title = EXCLUDED.title,
+          photo = COALESCE(EXCLUDED.photo, products.photo)
+        RETURNING id`,
+        [
+          productId,
+          legacyId,
+          item.title.trim(),
+          item.photo || null
+        ]
+      );
+
+      const actualProductId = productResult.rows[0].id;
+      const batchItemId = randomUUID();
+
+      const quantity = Number(item.quantity);
+
+      const wholesaleTotalTjs = round(
+        Number(item.wholesaleAmount) *
+        Number(item.wholesaleRateToTjs)
+      );
+
+      const cargoTotalTjs = round(
+        Number(item.cargoAmount) *
+        Number(item.cargoRateToTjs)
+      );
+
+      const unitCostTjs = round(
+        (wholesaleTotalTjs + cargoTotalTjs) / quantity,
+        4
+      );
+
+      await client.query(
+        `INSERT INTO purchase_batch_items (
+          id,
+          batch_id,
+          product_id,
+          initial_quantity,
+          wholesale_amount,
+          wholesale_currency,
+          wholesale_rate_to_tjs,
+          wholesale_total_tjs,
+          cargo_amount,
+          cargo_currency,
+          cargo_rate_to_tjs,
+          cargo_total_tjs,
+          unit_cost_tjs,
+          current_sale_price_tjs
+        )
+        VALUES (
+          $1, $2, $3, $4, $5, $6, $7,
+          $8, $9, $10, $11, $12, $13, $14
+        )`,
+        [
+          batchItemId,
+          batchId,
+          actualProductId,
+          quantity,
+          Number(item.wholesaleAmount),
+          item.wholesaleCurrency,
+          Number(item.wholesaleRateToTjs),
+          wholesaleTotalTjs,
+          Number(item.cargoAmount),
+          item.cargoCurrency,
+          Number(item.cargoRateToTjs),
+          cargoTotalTjs,
+          unitCostTjs,
+          Number(item.salePriceTjs)
+        ]
+      );
+
+      for (const variant of item.variants) {
+        await client.query(
+          `INSERT INTO purchase_batch_item_variants (
+            id,
+            batch_item_id,
+            color_name,
+            size_name,
+            initial_quantity
+          )
+          VALUES ($1, $2, $3, $4, $5)`,
+          [
+            randomUUID(),
+            batchItemId,
+            String(variant.color).trim(),
+            String(variant.size).trim(),
+            Number(variant.quantity)
+          ]
+        );
+      }
+
+      savedItems.push({
+        productId: actualProductId,
+        title: item.title.trim(),
+        quantity,
+        wholesaleTotalTjs,
+        cargoTotalTjs,
+        totalCostTjs: round(
+          wholesaleTotalTjs + cargoTotalTjs
+        ),
+        unitCostTjs,
+        salePriceTjs: Number(item.salePriceTjs)
+      });
+    }
+
+    await client.query('COMMIT');
+
+    return res.status(201).json({
+      success: true,
+      batchId,
+      batchNumber: batchResult.rows[0].batch_number,
+      purchasedAt: batchResult.rows[0].purchased_at,
+      items: savedItems
+    });
+
+  } catch (error) {
+    await client.query('ROLLBACK');
+
+    console.error('Purchase batch creation error:', error.message);
+
+    return res.status(500).json({
+      error: 'Не удалось сохранить закупочную партию'
+    });
+
+  } finally {
+    client.release();
+  }
+});
+
   const {
     courierName,
     courierChatId,
