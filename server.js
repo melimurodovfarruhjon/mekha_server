@@ -555,6 +555,7 @@ app.post('/api/purchase-batches', async (req, res) => {
   }
 });
 
+app.post('/api/orders', async (req, res) => {
   const {
     courierName,
     courierChatId,
