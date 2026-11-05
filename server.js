@@ -310,6 +310,58 @@ app.get('/api/products', async (req, res) => {
 });
 
 // =========================================
+// MEKHA SHOP: UPDATE PRODUCT
+// =========================================
+
+app.put('/api/products/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { title, photo } = req.body;
+
+    if (!title || !title.trim()) {
+      return res.status(400).json({
+        success: false,
+        error: 'Название товара обязательно'
+      });
+    }
+
+    const result = await pool.query(
+      `UPDATE products
+       SET title = $1,
+           photo = $2
+       WHERE id = $3
+         AND is_active = TRUE
+       RETURNING id, title, photo`,
+      [
+        title.trim(),
+        photo || '',
+        id
+      ]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'Товар не найден'
+      });
+    }
+
+    return res.json({
+      success: true,
+      product: result.rows[0]
+    });
+
+  } catch (error) {
+    console.error('Update product error:', error);
+
+    return res.status(500).json({
+      success: false,
+      error: 'Не удалось обновить товар'
+    });
+  }
+});
+
+// =========================================
 // MEKHA SHOP: CREATE PURCHASE BATCH
 // =========================================
 
