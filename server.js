@@ -362,6 +362,91 @@ app.put('/api/products/:id', async (req, res) => {
 });
 
 // =========================================
+// MEKHA SHOP: DELETE PRODUCT (SOFT DELETE)
+// =========================================
+
+app.delete('/api/products/:id', async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const { id } = req.params;
+
+    await client.query('BEGIN');
+
+    const productResult = await client.query(
+      `SELECT id
+       FROM products
+       WHERE id = $1
+         AND is_active = TRUE
+       FOR UPDATE`,
+      [id]
+    );
+
+    if (productResult.rowCount === 0) {
+      await client.query('ROLLBACK');
+
+      return res.status(404).json({
+        success: false,
+        error: 'Товар не найден'
+      });
+    }
+
+    const stockResult = await client.query(
+      `SELECT COALESCE(
+         SUM(
+           v.initial_quantity
+           - v.reserved_quantity
+           - v.sold_quantity
+         ), 0
+       )::INTEGER AS quantity
+       FROM purchase_batch_items bi
+       JOIN purchase_batch_item_variants v
+         ON v.batch_item_id = bi.id
+       WHERE bi.product_id = $1`,
+      [id]
+    );
+
+    const quantity = Number(stockResult.rows[0].quantity || 0);
+
+    if (quantity > 0) {
+      await client.query('ROLLBACK');
+
+      return res.status(409).json({
+        success: false,
+        error: `Нельзя удалить товар: на складе осталось ${quantity} шт.`
+      });
+    }
+
+    await client.query(
+      `UPDATE products
+       SET is_active = FALSE
+       WHERE id = $1`,
+      [id]
+    );
+
+    await client.query('COMMIT');
+
+    return res.json({
+      success: true,
+      message: 'Товар удалён из каталога'
+    });
+
+  } catch (error) {
+    await client.query('ROLLBACK');
+
+    console.error('Delete product error:', error);
+
+    return res.status(500).json({
+      success: false,
+      error: 'Не удалось удалить товар'
+    });
+
+  } finally {
+    client.release();
+  }
+});
+
+// =========================================
 // MEKHA SHOP: CREATE PURCHASE BATCH
 // =========================================
 
