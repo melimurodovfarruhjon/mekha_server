@@ -244,6 +244,72 @@ app.get('/api/db-health', async (req, res) => {
 // Создание заказа, сохранение в PostgreSQL и отправка курьеру
 
 // =========================================
+// MEKHA SHOP: GET PRODUCTS CATALOG
+// =========================================
+
+app.get('/api/products', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        p.id,
+        p.legacy_id AS "legacyId",
+        p.title,
+        p.photo,
+
+        COALESCE((
+          SELECT SUM(
+            v.initial_quantity
+            - v.reserved_quantity
+            - v.sold_quantity
+          )
+          FROM purchase_batch_items bi
+          JOIN purchase_batch_item_variants v
+            ON v.batch_item_id = bi.id
+          WHERE bi.product_id = p.id
+        ), 0)::INTEGER AS quantity,
+
+        latest.unit_cost_tjs AS "unitCostTjs",
+        latest.current_sale_price_tjs AS "salePriceTjs",
+        latest.wholesale_total_tjs AS "totalWholesaleTjs",
+        latest.wholesale_currency AS "wholesaleCurrency",
+        latest.cargo_total_tjs AS "cargoCostTjs",
+        latest.cargo_currency AS "cargoCurrency"
+
+      FROM products p
+
+      LEFT JOIN LATERAL (
+        SELECT
+          bi.unit_cost_tjs,
+          bi.current_sale_price_tjs,
+          bi.wholesale_total_tjs,
+          bi.wholesale_currency,
+          bi.cargo_total_tjs,
+          bi.cargo_currency
+        FROM purchase_batch_items bi
+        WHERE bi.product_id = p.id
+        ORDER BY bi.created_at DESC
+        LIMIT 1
+      ) latest ON TRUE
+
+      WHERE p.is_active = TRUE
+      ORDER BY p.created_at DESC
+    `);
+
+    return res.json({
+      success: true,
+      products: result.rows
+    });
+
+  } catch (error) {
+    console.error('Products catalog error:', error.message);
+
+    return res.status(500).json({
+      error: 'Не удалось загрузить каталог товаров'
+    });
+  }
+});
+
+// =========================================
 // MEKHA SHOP: CREATE PURCHASE BATCH
 // =========================================
 
