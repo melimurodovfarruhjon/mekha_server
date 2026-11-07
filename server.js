@@ -373,53 +373,84 @@ app.delete('/api/products/:id', async (req, res) => {
 
     await client.query('BEGIN');
 
+    // Lock the product so inventory and history cannot change mid-delete.
     const productResult = await client.query(
       `SELECT id
        FROM products
-       WHERE id = $1
-         AND is_active = TRUE
+       WHERE id = $1 AND is_active = TRUE
        FOR UPDATE`,
       [id]
     );
 
     if (productResult.rowCount === 0) {
       await client.query('ROLLBACK');
-
       return res.status(404).json({
         success: false,
         error: 'Товар не найден'
       });
     }
 
-    const stockResult = await client.query(
-      `SELECT COALESCE(
-         SUM(
-           v.initial_quantity
-           - v.reserved_quantity
-           - v.sold_quantity
-         ), 0
-       )::INTEGER AS quantity
-       FROM purchase_batch_items bi
-       JOIN purchase_batch_item_variants v
-         ON v.batch_item_id = bi.id
-       WHERE bi.product_id = $1`,
+    // Keep order and sales snapshots for historical reports, but detach
+    // them from the product that is being permanently removed.
+    await client.query(
+      `UPDATE order_items
+       SET product_id = NULL
+       WHERE product_id = $1`,
       [id]
     );
 
-    const quantity = Number(stockResult.rows[0].quantity || 0);
+    await client.query(
+      `UPDATE sale_items
+       SET product_id = NULL
+       WHERE product_id = $1`,
+      [id]
+    );
 
-    if (quantity > 0) {
-      await client.query('ROLLBACK');
+    // Remove stock allocations before deleting the stock variants.
+    await client.query(
+      `DELETE FROM inventory_allocations ia
+       USING purchase_batch_item_variants v,
+             purchase_batch_items bi
+       WHERE ia.variant_id = v.id
+         AND v.batch_item_id = bi.id
+         AND bi.product_id = $1`,
+      [id]
+    );
 
-      return res.status(409).json({
-        success: false,
-        error: `Нельзя удалить товар: на складе осталось ${quantity} шт.`
-      });
+    // Remove all variants and purchase records belonging to this product.
+    await client.query(
+      `DELETE FROM purchase_batch_item_variants v
+       USING purchase_batch_items bi
+       WHERE v.batch_item_id = bi.id
+         AND bi.product_id = $1`,
+      [id]
+    );
+
+    const deletedBatches = await client.query(
+      `DELETE FROM purchase_batch_items
+       WHERE product_id = $1
+       RETURNING batch_id`,
+      [id]
+    );
+
+    // Remove purchase batches only when they no longer contain any products.
+    const batchIds = [...new Set(deletedBatches.rows.map(row => row.batch_id))];
+
+    if (batchIds.length > 0) {
+      await client.query(
+        `DELETE FROM purchase_batches pb
+         WHERE pb.id = ANY($1::uuid[])
+           AND NOT EXISTS (
+             SELECT 1
+             FROM purchase_batch_items bi
+             WHERE bi.batch_id = pb.id
+           )`,
+        [batchIds]
+      );
     }
 
     await client.query(
-      `UPDATE products
-       SET is_active = FALSE
+      `DELETE FROM products
        WHERE id = $1`,
       [id]
     );
@@ -428,17 +459,16 @@ app.delete('/api/products/:id', async (req, res) => {
 
     return res.json({
       success: true,
-      message: 'Товар удалён из каталога'
+      message: 'Товар и его складские записи полностью удалены'
     });
 
   } catch (error) {
     await client.query('ROLLBACK');
-
     console.error('Delete product error:', error);
 
     return res.status(500).json({
       success: false,
-      error: 'Не удалось удалить товар'
+      error: 'Не удалось полностью удалить товар'
     });
 
   } finally {
