@@ -603,6 +603,86 @@ app.delete('/api/products/:id', async (req, res) => {
 });
 
 // =========================================
+// MEKHA SHOP: PURCHASE BATCH REPORTS
+// =========================================
+
+app.get('/api/purchase-batches', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        pb.id AS batch_id,
+        pb.batch_number,
+        pb.purchased_at,
+        pb.notes,
+        bi.id AS batch_item_id,
+        p.title AS product_title,
+        p.photo,
+        bi.initial_quantity,
+        COALESCE(SUM(v.sold_quantity), 0)::INTEGER AS sold_quantity,
+        GREATEST(
+          bi.initial_quantity - COALESCE(SUM(v.sold_quantity), 0),
+          0
+        )::INTEGER AS remaining_quantity,
+        bi.unit_cost_tjs,
+        bi.current_sale_price_tjs
+      FROM purchase_batches pb
+      JOIN purchase_batch_items bi ON bi.batch_id = pb.id
+      JOIN products p ON p.id = bi.product_id
+      LEFT JOIN purchase_batch_item_variants v
+        ON v.batch_item_id = bi.id
+      GROUP BY
+        pb.id,
+        pb.batch_number,
+        pb.purchased_at,
+        pb.notes,
+        bi.id,
+        p.title,
+        p.photo,
+        bi.initial_quantity,
+        bi.unit_cost_tjs,
+        bi.current_sale_price_tjs
+      ORDER BY pb.purchased_at DESC, pb.batch_number DESC, p.title ASC
+    `);
+
+    const batchesById = new Map();
+
+    for (const row of result.rows) {
+      if (!batchesById.has(row.batch_id)) {
+        batchesById.set(row.batch_id, {
+          id: row.batch_id,
+          batchNumber: row.batch_number,
+          purchasedAt: row.purchased_at,
+          notes: row.notes || '',
+          items: []
+        });
+      }
+
+      batchesById.get(row.batch_id).items.push({
+        id: row.batch_item_id,
+        title: row.product_title,
+        photo: row.photo || '',
+        deliveredQuantity: Number(row.initial_quantity) || 0,
+        soldQuantity: Number(row.sold_quantity) || 0,
+        remainingQuantity: Number(row.remaining_quantity) || 0,
+        unitCostTjs: Number(row.unit_cost_tjs) || 0,
+        salePriceTjs: Number(row.current_sale_price_tjs) || 0
+      });
+    }
+
+    return res.json({
+      success: true,
+      batches: Array.from(batchesById.values())
+    });
+  } catch (error) {
+    console.error('Purchase batch reports error:', error.message);
+    return res.status(500).json({
+      success: false,
+      error: 'Не удалось загрузить отчёты по поставкам'
+    });
+  }
+});
+
+// =========================================
 // MEKHA SHOP: CREATE PURCHASE BATCH
 // =========================================
 
