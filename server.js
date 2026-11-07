@@ -213,7 +213,45 @@ CREATE INDEX IF NOT EXISTS idx_inventory_allocations_variant
 }
 
 app.use(cors());
+
 app.use(express.json());
+
+// Сообщения из чата поддержки Mekha Shop отправляются администратору в Telegram.
+const SUPPORT_CHAT_ID = '907176273';
+const supportRateLimits = new Map();
+
+app.post('/api/support-message', async (req, res) => {
+  const message = typeof req.body?.message === 'string'
+    ? req.body.message.trim()
+    : '';
+
+  if (!message || message.length > 2000) {
+    return res.status(400).json({ error: 'Сообщение должно содержать от 1 до 2000 символов.' });
+  }
+
+  const clientKey = req.ip || req.socket.remoteAddress || 'unknown';
+  const now = Date.now();
+  const recent = (supportRateLimits.get(clientKey) || []).filter(time => now - time < 60000);
+
+  if (recent.length >= 5) {
+    return res.status(429).json({ error: 'Слишком много сообщений. Подождите минуту.' });
+  }
+
+  recent.push(now);
+  supportRateLimits.set(clientKey, recent);
+
+  try {
+    await bot.telegram.sendMessage(
+      SUPPORT_CHAT_ID,
+      '💬 Новое сообщение в службе поддержки Mekha Shop:\n\n' + message
+    );
+    return res.json({ success: true });
+  } catch (error) {
+    console.error('Support Telegram delivery failed:', error.message);
+    return res.status(502).json({ error: 'Не удалось доставить сообщение в Telegram.' });
+  }
+});
+
 
 app.use(
   bot.webhookCallback(WEBHOOK_PATH, {
