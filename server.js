@@ -413,7 +413,7 @@ app.get('/api/delivery-notifications/stream', (req, res) => {
 app.get('/api/dashboard-summary', async (req, res) => {
   try {
     const result = await pool.query(
-      \`WITH daily_sales AS (
+      `WITH daily_sales AS (
         SELECT
           COALESCE(SUM(si.quantity * si.unit_sale_price_tjs), 0) AS revenue_tjs,
           COALESCE(SUM(si.quantity * (si.unit_sale_price_tjs - si.unit_cost_tjs)), 0) AS profit_tjs,
@@ -445,7 +445,7 @@ app.get('/api/dashboard-summary', async (req, res) => {
         (SELECT COUNT(*) FROM inventory_by_product WHERE available > 0) AS "productsInStock",
         (SELECT COUNT(*) FROM inventory_by_product WHERE available > 0 AND available <= 3) AS "lowStockProducts",
         (SELECT COUNT(*) FROM inventory_by_product WHERE available = 0) AS "outOfStockProducts"
-      FROM daily_sales ds\`
+      FROM daily_sales ds`
     );
 
     return res.json({ success: true, summary: result.rows[0] });
