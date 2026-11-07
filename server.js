@@ -1016,6 +1016,76 @@ bot.on('callback_query', async (ctx) => {
       try {
         await client.query('BEGIN');
 
+        // Lock the order and re-check ownership/status inside the transaction.
+        const lockedOrder = await client.query(
+          `SELECT id, status
+           FROM orders
+           WHERE id = $1 AND courier_chat_id = $2
+           FOR UPDATE`,
+          [orderId, String(chatId)]
+        );
+
+        if (lockedOrder.rowCount !== 1) {
+          throw new Error('Заказ не найден или не принадлежит курьеру');
+        }
+
+        if (lockedOrder.rows[0].status !== 'pending') {
+          throw new Error('Заказ уже обработан');
+        }
+
+        // Read the authoritative order lines from PostgreSQL.
+        const orderItems = await client.query(
+          `SELECT product_id, quantity
+           FROM order_items
+           WHERE order_id = $1
+           ORDER BY id ASC`,
+          [orderId]
+        );
+
+        for (const item of orderItems.rows) {
+          // Free-text lines have no product_id and do not affect inventory.
+          if (!item.product_id) continue;
+
+          let remaining = Number(item.quantity);
+
+          const variants = await client.query(
+            `SELECT
+               v.id,
+               (v.initial_quantity - v.reserved_quantity - v.sold_quantity)::INTEGER AS available
+             FROM purchase_batch_items bi
+             JOIN purchase_batch_item_variants v ON v.batch_item_id = bi.id
+             WHERE bi.product_id = $1
+               AND v.initial_quantity - v.reserved_quantity - v.sold_quantity > 0
+             ORDER BY bi.created_at ASC, v.created_at ASC, v.id ASC
+             FOR UPDATE OF v`,
+            [item.product_id]
+          );
+
+          for (const variant of variants.rows) {
+            if (remaining <= 0) break;
+
+            const available = Number(variant.available) || 0;
+            const toSell = Math.min(remaining, available);
+
+            if (toSell <= 0) continue;
+
+            await client.query(
+              `UPDATE purchase_batch_item_variants
+               SET sold_quantity = sold_quantity + $2
+               WHERE id = $1`,
+              [variant.id, toSell]
+            );
+
+            remaining -= toSell;
+          }
+
+          if (remaining > 0) {
+            throw new Error(
+              `Недостаточно остатка на складе для товара "${item.product_id}". Не хватает: ${remaining}`
+            );
+          }
+        }
+
         const event = await client.query(
           `INSERT INTO order_events (
             order_id, event_type, telegram_callback_id
@@ -1026,21 +1096,22 @@ bot.on('callback_query', async (ctx) => {
           [orderId, String(ctx.callbackQuery.id)]
         );
 
-        if (event.rowCount > 0) {
-          await client.query(
-            `UPDATE orders
-             SET status = 'delivered', updated_at = NOW()
-             WHERE id = $1 AND status = 'pending'`,
-            [orderId]
-          );
+        if (event.rowCount === 0) {
+          throw new Error('Этот ответ уже обработан');
+        }
+
+        const updatedOrder = await client.query(
+          `UPDATE orders
+           SET status = 'delivered', updated_at = NOW()
+           WHERE id = $1 AND status = 'pending'`,
+          [orderId]
+        );
+
+        if (updatedOrder.rowCount !== 1) {
+          throw new Error('Не удалось подтвердить доставку: заказ уже обработан');
         }
 
         await client.query('COMMIT');
-
-        if (event.rowCount === 0) {
-          await ctx.answerCbQuery('Этот ответ уже обработан');
-          return;
-        }
       } catch (error) {
         await client.query('ROLLBACK');
         throw error;
@@ -1048,9 +1119,9 @@ bot.on('callback_query', async (ctx) => {
         client.release();
       }
 
-      await ctx.answerCbQuery('Заказ отмечен как доставленный');
+      await ctx.answerCbQuery('Доставка подтверждена, склад списан');
       await ctx.editMessageText(
-        '✅ Заказ успешно доставлен клиенту.'
+        '✅ Заказ доставлен. Остатки склада обновлены.'
       );
 
       await sendPushNotification(
