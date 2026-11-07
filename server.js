@@ -339,6 +339,51 @@ app.use(
   })
 );
 
+app.get('/api/delivery-notifications', async (req, res) => {
+  const requestedLimit = Number.parseInt(req.query.limit, 10);
+  const limit = Number.isInteger(requestedLimit)
+    ? Math.min(Math.max(requestedLimit, 1), 50)
+    : 20;
+
+  try {
+    const result = await pool.query(
+      `SELECT
+        oe.id,
+        o.public_number AS "publicNumber",
+        oe.created_at AS "deliveredAt",
+        o.courier_name AS "courierName",
+        COALESCE(
+          json_agg(
+            json_build_object(
+              'title', oi.title,
+              'quantity', oi.quantity
+            ) ORDER BY oi.id
+          ) FILTER (WHERE oi.id IS NOT NULL),
+          '[]'::json
+        ) AS items
+      FROM order_events oe
+      JOIN orders o ON o.id = oe.order_id
+      LEFT JOIN order_items oi ON oi.order_id = o.id
+      WHERE oe.event_type = 'DELIVERED'
+      GROUP BY oe.id, o.id
+      ORDER BY oe.created_at DESC
+      LIMIT $1`,
+      [limit]
+    );
+
+    return res.json({
+      success: true,
+      notifications: result.rows
+    });
+  } catch (error) {
+    console.error('Delivery notifications fetch failed:', error.message);
+    return res.status(500).json({
+      success: false,
+      error: 'Не удалось загрузить уведомления о доставках'
+    });
+  }
+});
+
 app.get('/api/db-health', async (req, res) => {
   try {
     const result = await pool.query('SELECT NOW() AS server_time');
