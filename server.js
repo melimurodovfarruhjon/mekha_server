@@ -410,6 +410,54 @@ app.get('/api/delivery-notifications/stream', (req, res) => {
   });
 });
 
+app.get('/api/dashboard-summary', async (req, res) => {
+  try {
+    const result = await pool.query(
+      \`WITH daily_sales AS (
+        SELECT
+          COALESCE(SUM(si.quantity * si.unit_sale_price_tjs), 0) AS revenue_tjs,
+          COALESCE(SUM(si.quantity * (si.unit_sale_price_tjs - si.unit_cost_tjs)), 0) AS profit_tjs,
+          COALESCE(SUM(si.quantity), 0) AS units_sold
+        FROM sales s
+        JOIN sale_items si ON si.sale_id = s.id
+        WHERE (s.created_at AT TIME ZONE 'Asia/Dushanbe')::date =
+              (NOW() AT TIME ZONE 'Asia/Dushanbe')::date
+      ),
+      inventory_by_product AS (
+        SELECT
+          p.id,
+          COALESCE(SUM(v.initial_quantity - v.reserved_quantity - v.sold_quantity), 0) AS available
+        FROM products p
+        LEFT JOIN purchase_batch_items bi ON bi.product_id = p.id
+        LEFT JOIN purchase_batch_item_variants v ON v.batch_item_id = bi.id
+        WHERE p.is_active = TRUE
+        GROUP BY p.id
+      )
+      SELECT
+        ds.revenue_tjs AS "revenueTjs",
+        ds.profit_tjs AS "profitTjs",
+        ds.units_sold AS "unitsSold",
+        (SELECT COUNT(*) FROM order_events oe
+          WHERE oe.event_type = 'DELIVERED'
+            AND (oe.created_at AT TIME ZONE 'Asia/Dushanbe')::date =
+                (NOW() AT TIME ZONE 'Asia/Dushanbe')::date) AS "deliveredToday",
+        (SELECT COUNT(*) FROM orders WHERE status = 'pending') AS "pendingOrders",
+        (SELECT COUNT(*) FROM inventory_by_product WHERE available > 0) AS "productsInStock",
+        (SELECT COUNT(*) FROM inventory_by_product WHERE available > 0 AND available <= 3) AS "lowStockProducts",
+        (SELECT COUNT(*) FROM inventory_by_product WHERE available = 0) AS "outOfStockProducts"
+      FROM daily_sales ds\`
+    );
+
+    return res.json({ success: true, summary: result.rows[0] });
+  } catch (error) {
+    console.error('Dashboard summary fetch failed:', error.message);
+    return res.status(500).json({
+      success: false,
+      error: 'Не удалось загрузить сводку главной панели'
+    });
+  }
+});
+
 app.get('/api/db-health', async (req, res) => {
   try {
     const result = await pool.query('SELECT NOW() AS server_time');
