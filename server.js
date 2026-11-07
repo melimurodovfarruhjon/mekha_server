@@ -266,8 +266,12 @@ app.post('/api/support-message', async (req, res) => {
     );
     const telegramMessage = await bot.telegram.sendMessage(
       SUPPORT_CHAT_ID,
-      '💬 Новое сообщение в службе поддержки Mekha Shop\nЧат: ' + clientId +
-      '\n\n' + message + '\n\n↩️ Ответьте на это сообщение через Reply, чтобы ответ пришёл клиенту.'
+      '💬 Новое сообщение в службе поддержки Mekha Shop\\nЧат: ' + clientId +
+      '\\n\\n' + message,
+      { reply_markup: { inline_keyboard: [[
+        { text: '✉️ Ответить клиенту', callback_data: 'support_reply:' + clientId },
+        { text: '🗑 Удалить чат', callback_data: 'support_delete:' + clientId }
+      ]] } }
     );
     await db.query(
       'INSERT INTO support_telegram_links (telegram_message_id, client_id) VALUES ($1, $2) ON CONFLICT (telegram_message_id) DO UPDATE SET client_id = EXCLUDED.client_id',
@@ -1106,6 +1110,7 @@ async function sendPushNotification(title, body) {
 
 
 const waitingForReason = new Map();
+const waitingForSupportReply = new Map();
 
 // Проверка принадлежности заказа курьеру
 async function getCourierOrder(orderId, chatId) {
@@ -1125,6 +1130,58 @@ bot.on('callback_query', async (ctx) => {
   const chatId = ctx.chat.id;
 
   try {
+    if (String(chatId) === SUPPORT_CHAT_ID && data.startsWith('support_reply:')) {
+      const clientId = data.slice('support_reply:'.length);
+      if (!/^[0-9a-f-]{36}$/i.test(clientId)) { await ctx.answerCbQuery('Некорректный чат'); return; }
+      waitingForSupportReply.set(String(chatId), clientId);
+      await ctx.answerCbQuery('Режим ответа включён');
+      await ctx.reply('✉️ Напишите сообщение клиенту. Следующее текстовое сообщение будет отправлено в Mekha Shop.');
+      return;
+    }
+    if (String(chatId) === SUPPORT_CHAT_ID && data.startsWith('support_delete:')) {
+      const clientId = data.slice('support_delete:'.length);
+      if (!/^[0-9a-f-]{36}$/i.test(clientId)) { await ctx.answerCbQuery('Некорректный чат'); return; }
+      await ctx.answerCbQuery('Подтвердите удаление');
+      await ctx.editMessageReplyMarkup({ inline_keyboard: [[
+        { text: 'Да, удалить чат', callback_data: 'support_delete_confirm:' + clientId },
+        { text: 'Отмена', callback_data: 'support_delete_cancel:' + clientId }
+      ]] });
+      return;
+    }
+    if (String(chatId) === SUPPORT_CHAT_ID && data.startsWith('support_delete_cancel:')) {
+      const clientId = data.slice('support_delete_cancel:'.length);
+      await ctx.answerCbQuery('Удаление отменено');
+      await ctx.editMessageReplyMarkup({ inline_keyboard: [[
+        { text: '✉️ Ответить клиенту', callback_data: 'support_reply:' + clientId },
+        { text: '🗑 Удалить чат', callback_data: 'support_delete:' + clientId }
+      ]] });
+      return;
+    }
+    if (String(chatId) === SUPPORT_CHAT_ID && data.startsWith('support_delete_confirm:')) {
+      const clientId = data.slice('support_delete_confirm:'.length);
+      const db = await pool.connect();
+      let messageIds = [];
+      try {
+        await db.query('BEGIN');
+        const links = await db.query('SELECT telegram_message_id FROM support_telegram_links WHERE client_id = $1', [clientId]);
+        messageIds = links.rows.map(row => Number(row.telegram_message_id));
+        await db.query('DELETE FROM support_messages WHERE client_id = $1', [clientId]);
+        await db.query('DELETE FROM support_telegram_links WHERE client_id = $1', [clientId]);
+        await db.query('COMMIT');
+      } catch (error) {
+        await db.query('ROLLBACK');
+        throw error;
+      } finally { db.release(); }
+      waitingForSupportReply.delete(String(chatId));
+      for (const messageId of messageIds) {
+        try { await ctx.telegram.deleteMessage(chatId, messageId); }
+        catch (error) { console.warn('Could not delete Telegram support message:', messageId, error.message); }
+      }
+      try { await ctx.deleteMessage(); } catch (_) {}
+      await ctx.answerCbQuery('Диалог удалён');
+      await ctx.reply('🗑 Диалог удалён из Mekha Shop. История переписки очищена.');
+      return;
+    }
     const [action, orderId] = data.split(':');
 
     if (!orderId || !['delivered', 'return'].includes(action)) {
@@ -1283,6 +1340,24 @@ bot.on('callback_query', async (ctx) => {
 
 // Получение причины возврата
 bot.on('text', async (ctx, next) => {
+  if (String(ctx.chat.id) === SUPPORT_CHAT_ID && waitingForSupportReply.has(String(ctx.chat.id))) {
+    const clientId = waitingForSupportReply.get(String(ctx.chat.id));
+    const replyText = String(ctx.message.text || '').trim();
+    if (!replyText || replyText.length > 2000) {
+      await ctx.reply('Сообщение должно содержать от 1 до 2000 символов.');
+      return;
+    }
+    try {
+      await pool.query("INSERT INTO support_messages (client_id, sender, message, is_read) VALUES ($1, 'support', $2, FALSE)", [clientId, replyText]);
+      waitingForSupportReply.delete(String(ctx.chat.id));
+      await ctx.reply('✅ Сообщение отправлено клиенту в Mekha Shop.');
+    } catch (error) {
+      console.error('Support button reply failed:', error.message);
+      await ctx.reply('Не удалось отправить сообщение. Попробуйте ещё раз.');
+    }
+    return;
+  }
+
   // Администратор удаляет диалог командой /deletechat в Reply на сообщение клиента от бота.
   if (String(ctx.chat.id) === SUPPORT_CHAT_ID && /^\/deletechat(?:@\w+)?(?:\s|$)/i.test(ctx.message.text || '')) {
     const deleteReplyToId = ctx.message.reply_to_message?.message_id;
