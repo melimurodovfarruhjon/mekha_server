@@ -84,6 +84,25 @@ ALTER TABLE order_events
 ADD COLUMN IF NOT EXISTS frontend_processed_at TIMESTAMPTZ;
 
 
+    CREATE TABLE IF NOT EXISTS support_messages (
+      id BIGSERIAL PRIMARY KEY,
+      client_id UUID NOT NULL,
+      sender TEXT NOT NULL CHECK (sender IN ('client', 'support')),
+      message TEXT NOT NULL,
+      telegram_message_id BIGINT,
+      is_read BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_support_messages_client
+      ON support_messages(client_id, id);
+
+    CREATE TABLE IF NOT EXISTS support_telegram_links (
+      telegram_message_id BIGINT PRIMARY KEY,
+      client_id UUID NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
     CREATE TABLE IF NOT EXISTS push_subscriptions (
       id BIGSERIAL PRIMARY KEY,
       endpoint TEXT NOT NULL UNIQUE,
@@ -221,10 +240,12 @@ const SUPPORT_CHAT_ID = '907176273';
 const supportRateLimits = new Map();
 
 app.post('/api/support-message', async (req, res) => {
-  const message = typeof req.body?.message === 'string'
-    ? req.body.message.trim()
-    : '';
+  const message = typeof req.body?.message === 'string' ? req.body.message.trim() : '';
+  const clientId = typeof req.body?.clientId === 'string' ? req.body.clientId : '';
 
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(clientId)) {
+    return res.status(400).json({ error: 'Некорректный идентификатор чата.' });
+  }
   if (!message || message.length > 2000) {
     return res.status(400).json({ error: 'Сообщение должно содержать от 1 до 2000 символов.' });
   }
@@ -232,23 +253,68 @@ app.post('/api/support-message', async (req, res) => {
   const clientKey = req.ip || req.socket.remoteAddress || 'unknown';
   const now = Date.now();
   const recent = (supportRateLimits.get(clientKey) || []).filter(time => now - time < 60000);
-
-  if (recent.length >= 5) {
-    return res.status(429).json({ error: 'Слишком много сообщений. Подождите минуту.' });
-  }
-
+  if (recent.length >= 5) return res.status(429).json({ error: 'Слишком много сообщений. Подождите минуту.' });
   recent.push(now);
   supportRateLimits.set(clientKey, recent);
 
+  const db = await pool.connect();
   try {
-    await bot.telegram.sendMessage(
-      SUPPORT_CHAT_ID,
-      '💬 Новое сообщение в службе поддержки Mekha Shop:\n\n' + message
+    await db.query('BEGIN');
+    const saved = await db.query(
+      "INSERT INTO support_messages (client_id, sender, message) VALUES ($1, 'client', $2) RETURNING id",
+      [clientId, message]
     );
-    return res.json({ success: true });
+    const telegramMessage = await bot.telegram.sendMessage(
+      SUPPORT_CHAT_ID,
+      '💬 Новое сообщение в службе поддержки Mekha Shop\nЧат: ' + clientId +
+      '\n\n' + message + '\n\n↩️ Ответьте на это сообщение через Reply, чтобы ответ пришёл клиенту.'
+    );
+    await db.query(
+      'INSERT INTO support_telegram_links (telegram_message_id, client_id) VALUES ($1, $2) ON CONFLICT (telegram_message_id) DO UPDATE SET client_id = EXCLUDED.client_id',
+      [telegramMessage.message_id, clientId]
+    );
+    await db.query('COMMIT');
+    return res.json({ success: true, messageId: saved.rows[0].id });
   } catch (error) {
-    console.error('Support Telegram delivery failed:', error.message);
+    await db.query('ROLLBACK');
+    console.error('Support message delivery failed:', error.message);
     return res.status(502).json({ error: 'Не удалось доставить сообщение в Telegram.' });
+  } finally {
+    db.release();
+  }
+});
+
+app.get('/api/support-messages', async (req, res) => {
+  const clientId = String(req.query.clientId || '');
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(clientId)) {
+    return res.status(400).json({ error: 'Некорректный идентификатор чата.' });
+  }
+  try {
+    const result = await pool.query(
+      'SELECT id, sender, message, is_read, created_at FROM support_messages WHERE client_id = $1 ORDER BY id ASC',
+      [clientId]
+    );
+    res.json({ messages: result.rows });
+  } catch (error) {
+    console.error('Support history fetch failed:', error.message);
+    res.status(500).json({ error: 'Не удалось загрузить сообщения.' });
+  }
+});
+
+app.post('/api/support-read', async (req, res) => {
+  const clientId = String(req.body?.clientId || '');
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(clientId)) {
+    return res.status(400).json({ error: 'Некорректный идентификатор чата.' });
+  }
+  try {
+    await pool.query(
+      "UPDATE support_messages SET is_read = TRUE WHERE client_id = $1 AND sender = 'support' AND is_read = FALSE",
+      [clientId]
+    );
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Support read acknowledgement failed:', error.message);
+    res.status(500).json({ error: 'Не удалось отметить сообщения прочитанными.' });
   }
 });
 
@@ -1216,6 +1282,36 @@ bot.on('callback_query', async (ctx) => {
 });
 
 // Получение причины возврата
+bot.on('text', async (ctx, next) => {
+  const replyToId = ctx.message.reply_to_message?.message_id;
+  if (String(ctx.chat.id) === SUPPORT_CHAT_ID && replyToId) {
+    try {
+      const link = await pool.query(
+        'SELECT client_id FROM support_telegram_links WHERE telegram_message_id = $1',
+        [replyToId]
+      );
+      if (link.rows[0]) {
+        const replyText = String(ctx.message.text || '').trim();
+        if (!replyText) {
+          await ctx.reply('Для ответа клиенту отправьте текстовое сообщение.');
+          return;
+        }
+        await pool.query(
+          "INSERT INTO support_messages (client_id, sender, message, is_read) VALUES ($1, 'support', $2, FALSE)",
+          [link.rows[0].client_id, replyText]
+        );
+        await ctx.reply('✅ Ответ отправлен клиенту в Mekha Shop.');
+        return;
+      }
+    } catch (error) {
+      console.error('Support reply routing failed:', error.message);
+      await ctx.reply('Не удалось отправить ответ клиенту.');
+      return;
+    }
+  }
+  return next();
+});
+
 bot.on('text', async (ctx) => {
   const chatId = String(ctx.chat.id);
   const orderId = waitingForReason.get(chatId);
