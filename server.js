@@ -1149,9 +1149,9 @@ bot.on('callback_query', async (ctx) => {
         client.release();
       }
 
-      await ctx.answerCbQuery('Доставка подтверждена, склад списан');
+      await ctx.answerCbQuery('Доставка подтверждена');
       await ctx.editMessageText(
-        '✅ Заказ доставлен. Остатки склада обновлены.'
+        '✅ Заказ доставлен.'
       );
 
       await sendPushNotification(
