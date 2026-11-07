@@ -1283,6 +1283,61 @@ bot.on('callback_query', async (ctx) => {
 
 // Получение причины возврата
 bot.on('text', async (ctx, next) => {
+  // Администратор удаляет диалог командой /deletechat в Reply на сообщение клиента от бота.
+  if (String(ctx.chat.id) === SUPPORT_CHAT_ID && /^\/deletechat(?:@\w+)?(?:\s|$)/i.test(ctx.message.text || '')) {
+    const deleteReplyToId = ctx.message.reply_to_message?.message_id;
+    if (!deleteReplyToId) {
+      await ctx.reply('Для удаления диалога отправьте /deletechat ответом (Reply) на исходное сообщение клиента от бота.');
+      return;
+    }
+
+    const link = await pool.query(
+      'SELECT client_id FROM support_telegram_links WHERE telegram_message_id = $1',
+      [deleteReplyToId]
+    );
+    if (!link.rows[0]) {
+      await ctx.reply('Диалог не найден. Ответьте командой на исходное сообщение клиента от бота.');
+      return;
+    }
+
+    const clientId = link.rows[0].client_id;
+    const db = await pool.connect();
+    let linkedMessageIds = [];
+    try {
+      await db.query('BEGIN');
+      const links = await db.query(
+        'SELECT telegram_message_id FROM support_telegram_links WHERE client_id = $1',
+        [clientId]
+      );
+      linkedMessageIds = links.rows.map(row => Number(row.telegram_message_id));
+      await db.query('DELETE FROM support_messages WHERE client_id = $1', [clientId]);
+      await db.query('DELETE FROM support_telegram_links WHERE client_id = $1', [clientId]);
+      await db.query('COMMIT');
+    } catch (error) {
+      await db.query('ROLLBACK');
+      console.error('Support chat deletion failed:', error.message);
+      await ctx.reply('Не удалось удалить диалог. Попробуйте позже.');
+      return;
+    } finally {
+      db.release();
+    }
+
+    for (const messageId of linkedMessageIds) {
+      try {
+        await ctx.telegram.deleteMessage(ctx.chat.id, messageId);
+      } catch (error) {
+        console.warn('Could not delete Telegram support message:', messageId, error.message);
+      }
+    }
+    try {
+      await ctx.deleteMessage();
+    } catch (error) {
+      console.warn('Could not delete /deletechat command:', error.message);
+    }
+    await ctx.reply('🗑 Диалог удалён из Mekha Shop. История приложения и привязки Telegram очищены.');
+    return;
+  }
+
   const replyToId = ctx.message.reply_to_message?.message_id;
   if (String(ctx.chat.id) === SUPPORT_CHAT_ID && replyToId) {
     try {
