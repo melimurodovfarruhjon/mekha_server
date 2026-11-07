@@ -516,6 +516,32 @@ app.delete('/api/products/:id', async (req, res) => {
       });
     }
 
+    // A product with any historical sales must be hidden, not physically
+    // removed: its purchase batches are the source of truth for old reports.
+    const salesHistory = await client.query(
+      `SELECT EXISTS (
+         SELECT 1
+         FROM purchase_batch_items bi
+         JOIN purchase_batch_item_variants v ON v.batch_item_id = bi.id
+         WHERE bi.product_id = $1 AND v.sold_quantity > 0
+       ) OR EXISTS (
+         SELECT 1 FROM sale_items WHERE product_id = $1
+       ) AS has_sales`,
+      [id]
+    );
+
+    if (salesHistory.rows[0].has_sales) {
+      await client.query(
+        'UPDATE products SET is_active = FALSE WHERE id = $1',
+        [id]
+      );
+      await client.query('COMMIT');
+      return res.json({
+        success: true,
+        message: 'Товар скрыт из каталога. История поставок и продаж сохранена для отчётов.'
+      });
+    }
+
     // Keep order and sales snapshots for historical reports, but detach
     // them from the product that is being permanently removed.
     await client.query(
