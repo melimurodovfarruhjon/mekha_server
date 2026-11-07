@@ -609,6 +609,29 @@ app.delete('/api/products/:id', async (req, res) => {
 app.get('/api/purchase-batches', async (req, res) => {
   try {
     const result = await pool.query(`
+      WITH allocation_totals AS (
+        SELECT
+          ia.variant_id,
+          SUM(ia.quantity)::INTEGER AS allocated_quantity,
+          SUM(ia.quantity * si.unit_sale_price_tjs) AS revenue_tjs,
+          SUM(ia.quantity * (si.unit_sale_price_tjs - si.unit_cost_tjs)) AS profit_tjs,
+          BOOL_OR(si.unit_sale_price_tjs <= 0) AS has_missing_sale_price
+        FROM inventory_allocations ia
+        JOIN sale_items si ON si.id = ia.sale_item_id
+        GROUP BY ia.variant_id
+      ),
+      variant_totals AS (
+        SELECT
+          v.batch_item_id,
+          SUM(v.sold_quantity)::INTEGER AS sold_quantity,
+          SUM(COALESCE(a.allocated_quantity, 0))::INTEGER AS allocated_quantity,
+          SUM(COALESCE(a.revenue_tjs, 0)) AS allocated_revenue_tjs,
+          SUM(COALESCE(a.profit_tjs, 0)) AS allocated_profit_tjs,
+          BOOL_OR(COALESCE(a.has_missing_sale_price, FALSE)) AS allocated_missing_price
+        FROM purchase_batch_item_variants v
+        LEFT JOIN allocation_totals a ON a.variant_id = v.id
+        GROUP BY v.batch_item_id
+      )
       SELECT
         pb.id AS batch_id,
         pb.batch_number,
@@ -618,29 +641,34 @@ app.get('/api/purchase-batches', async (req, res) => {
         p.title AS product_title,
         p.photo,
         bi.initial_quantity,
-        COALESCE(SUM(v.sold_quantity), 0)::INTEGER AS sold_quantity,
+        COALESCE(vt.sold_quantity, 0)::INTEGER AS sold_quantity,
         GREATEST(
-          bi.initial_quantity - COALESCE(SUM(v.sold_quantity), 0),
+          bi.initial_quantity - COALESCE(vt.sold_quantity, 0),
           0
         )::INTEGER AS remaining_quantity,
         bi.unit_cost_tjs,
-        bi.current_sale_price_tjs
+        bi.current_sale_price_tjs,
+        (
+          COALESCE(vt.allocated_revenue_tjs, 0) +
+          GREATEST(COALESCE(vt.sold_quantity, 0) - COALESCE(vt.allocated_quantity, 0), 0)
+            * bi.current_sale_price_tjs
+        ) AS revenue_tjs,
+        (
+          COALESCE(vt.allocated_profit_tjs, 0) +
+          GREATEST(COALESCE(vt.sold_quantity, 0) - COALESCE(vt.allocated_quantity, 0), 0)
+            * (bi.current_sale_price_tjs - bi.unit_cost_tjs)
+        ) AS profit_tjs,
+        (
+          COALESCE(vt.allocated_missing_price, FALSE) OR
+          (
+            GREATEST(COALESCE(vt.sold_quantity, 0) - COALESCE(vt.allocated_quantity, 0), 0) > 0
+            AND bi.current_sale_price_tjs <= 0
+          )
+        ) AS has_missing_sale_price
       FROM purchase_batches pb
       JOIN purchase_batch_items bi ON bi.batch_id = pb.id
       JOIN products p ON p.id = bi.product_id
-      LEFT JOIN purchase_batch_item_variants v
-        ON v.batch_item_id = bi.id
-      GROUP BY
-        pb.id,
-        pb.batch_number,
-        pb.purchased_at,
-        pb.notes,
-        bi.id,
-        p.title,
-        p.photo,
-        bi.initial_quantity,
-        bi.unit_cost_tjs,
-        bi.current_sale_price_tjs
+      LEFT JOIN variant_totals vt ON vt.batch_item_id = bi.id
       ORDER BY pb.purchased_at DESC, pb.batch_number DESC, p.title ASC
     `);
 
@@ -665,7 +693,10 @@ app.get('/api/purchase-batches', async (req, res) => {
         soldQuantity: Number(row.sold_quantity) || 0,
         remainingQuantity: Number(row.remaining_quantity) || 0,
         unitCostTjs: Number(row.unit_cost_tjs) || 0,
-        salePriceTjs: Number(row.current_sale_price_tjs) || 0
+        salePriceTjs: Number(row.current_sale_price_tjs) || 0,
+        revenueTjs: Number(row.revenue_tjs) || 0,
+        profitTjs: Number(row.profit_tjs) || 0,
+        hasMissingSalePrice: Boolean(row.has_missing_sale_price)
       });
     }
 
@@ -681,10 +712,6 @@ app.get('/api/purchase-batches', async (req, res) => {
     });
   }
 });
-
-// =========================================
-// MEKHA SHOP: CREATE PURCHASE BATCH
-// =========================================
 
 app.post('/api/purchase-batches', async (req, res) => {
   const { items, notes } = req.body;
@@ -1324,12 +1351,23 @@ bot.on('callback_query', async (ctx) => {
 
         // Read the authoritative order lines from PostgreSQL.
         const orderItems = await client.query(
-          `SELECT product_id, quantity
+          `SELECT product_id, title, quantity
            FROM order_items
            WHERE order_id = $1
            ORDER BY id ASC`,
           [orderId]
         );
+
+        const saleId = orderItems.rows.some(item => item.product_id)
+          ? randomUUID()
+          : null;
+
+        if (saleId) {
+          await client.query(
+            'INSERT INTO sales (id, comment) VALUES ($1, $2)',
+            [saleId, `Заказ ${orderId}`]
+          );
+        }
 
         for (const item of orderItems.rows) {
           // Free-text lines have no product_id and do not affect inventory.
@@ -1340,6 +1378,10 @@ bot.on('callback_query', async (ctx) => {
           const variants = await client.query(
             `SELECT
                v.id,
+               v.color_name,
+               v.size_name,
+               bi.unit_cost_tjs,
+               bi.current_sale_price_tjs,
                (v.initial_quantity - v.reserved_quantity - v.sold_quantity)::INTEGER AS available
              FROM purchase_batch_items bi
              JOIN purchase_batch_item_variants v ON v.batch_item_id = bi.id
@@ -1363,6 +1405,40 @@ bot.on('callback_query', async (ctx) => {
                SET sold_quantity = sold_quantity + $2
                WHERE id = $1`,
               [variant.id, toSell]
+            );
+
+            // Save a financial snapshot for this exact FIFO batch allocation.
+            // This keeps historical revenue and profit unchanged if prices are edited later.
+            const saleItemId = randomUUID();
+            const unitSalePriceTjs = Number(variant.current_sale_price_tjs) || 0;
+            const unitCostTjs = Number(variant.unit_cost_tjs) || 0;
+
+            await client.query(
+              `INSERT INTO sale_items (
+                id, sale_id, product_id, title_snapshot,
+                color_name, size_name, quantity,
+                unit_sale_price_tjs, unit_cost_tjs
+              )
+              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+              [
+                saleItemId,
+                saleId,
+                item.product_id,
+                item.title || 'Товар',
+                variant.color_name || 'Без цвета',
+                variant.size_name || 'Без размера',
+                toSell,
+                unitSalePriceTjs,
+                unitCostTjs
+              ]
+            );
+
+            await client.query(
+              `INSERT INTO inventory_allocations (
+                sale_item_id, variant_id, quantity, unit_cost_tjs
+              )
+              VALUES ($1, $2, $3, $4)`,
+              [saleItemId, variant.id, toSell, unitCostTjs]
             );
 
             remaining -= toSell;
