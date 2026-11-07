@@ -30,6 +30,16 @@ if (!process.env.DATABASE_URL) {
   throw new Error('DATABASE_URL is not configured');
 }
 
+const deliveryStreamClients = new Set();
+
+function broadcastDeliveryNotification(notification) {
+  const payload = `data: ${JSON.stringify(notification)}\n\n`;
+  for (const client of deliveryStreamClients) {
+    try { client.write(payload); }
+    catch (error) { deliveryStreamClients.delete(client); }
+  }
+}
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   max: 5,
@@ -382,6 +392,22 @@ app.get('/api/delivery-notifications', async (req, res) => {
       error: 'Не удалось загрузить уведомления о доставках'
     });
   }
+});
+
+app.get('/api/delivery-notifications/stream', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders?.();
+  res.write('retry: 2000\n\n');
+  deliveryStreamClients.add(res);
+  const heartbeat = setInterval(() => {
+    if (!res.writableEnded) res.write(': heartbeat\n\n');
+  }, 20000);
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    deliveryStreamClients.delete(res);
+  });
 });
 
 app.get('/api/db-health', async (req, res) => {
@@ -1557,6 +1583,33 @@ bot.on('callback_query', async (ctx) => {
         throw error;
       } finally {
         client.release();
+      }
+
+      // Push the committed delivery to connected dashboards immediately.
+      try {
+        const notificationResult = await pool.query(
+          `SELECT
+            oe.id,
+            o.public_number AS "publicNumber",
+            oe.created_at AS "deliveredAt",
+            o.courier_name AS "courierName",
+            COALESCE(
+              json_agg(json_build_object('title', oi.title, 'quantity', oi.quantity) ORDER BY oi.id)
+                FILTER (WHERE oi.id IS NOT NULL),
+              '[]'::json
+            ) AS items
+           FROM order_events oe
+           JOIN orders o ON o.id = oe.order_id
+           LEFT JOIN order_items oi ON oi.order_id = o.id
+           WHERE oe.order_id = $1 AND oe.event_type = 'DELIVERED'
+           GROUP BY oe.id, o.id
+           ORDER BY oe.created_at DESC
+           LIMIT 1`,
+          [orderId]
+        );
+        if (notificationResult.rows[0]) broadcastDeliveryNotification(notificationResult.rows[0]);
+      } catch (pushError) {
+        console.error('Could not broadcast delivery notification:', pushError.message);
       }
 
       await ctx.answerCbQuery('Доставка подтверждена');
