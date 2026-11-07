@@ -614,7 +614,7 @@ app.get('/api/purchase-batches', async (req, res) => {
           ia.variant_id,
           SUM(ia.quantity)::INTEGER AS allocated_quantity,
           SUM(ia.quantity * si.unit_sale_price_tjs) AS revenue_tjs,
-          SUM(ia.quantity * (si.unit_sale_price_tjs - si.unit_cost_tjs)) AS profit_tjs,
+          SUM(CASE WHEN si.unit_sale_price_tjs > 0 THEN ia.quantity * (si.unit_sale_price_tjs - si.unit_cost_tjs) ELSE 0 END) AS profit_tjs,
           BOOL_OR(si.unit_sale_price_tjs <= 0) AS has_missing_sale_price
         FROM inventory_allocations ia
         JOIN sale_items si ON si.id = ia.sale_item_id
@@ -655,8 +655,12 @@ app.get('/api/purchase-batches', async (req, res) => {
         ) AS revenue_tjs,
         (
           COALESCE(vt.allocated_profit_tjs, 0) +
-          GREATEST(COALESCE(vt.sold_quantity, 0) - COALESCE(vt.allocated_quantity, 0), 0)
-            * (bi.current_sale_price_tjs - bi.unit_cost_tjs)
+          CASE
+            WHEN bi.current_sale_price_tjs > 0 THEN
+              GREATEST(COALESCE(vt.sold_quantity, 0) - COALESCE(vt.allocated_quantity, 0), 0)
+                * (bi.current_sale_price_tjs - bi.unit_cost_tjs)
+            ELSE 0
+          END
         ) AS profit_tjs,
         (
           COALESCE(vt.allocated_missing_price, FALSE) OR
