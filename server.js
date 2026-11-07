@@ -120,6 +120,9 @@ CREATE TABLE IF NOT EXISTS products (
   legacy_id TEXT UNIQUE,
   title TEXT NOT NULL,
   photo TEXT,
+  current_wholesale_total_tjs NUMERIC(14,2) NOT NULL DEFAULT 0 CHECK (current_wholesale_total_tjs >= 0),
+  current_cargo_total_tjs NUMERIC(14,2) NOT NULL DEFAULT 0 CHECK (current_cargo_total_tjs >= 0),
+  current_sale_price_tjs NUMERIC(14,2) NOT NULL DEFAULT 0 CHECK (current_sale_price_tjs >= 0),
   is_active BOOLEAN NOT NULL DEFAULT TRUE,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -229,6 +232,13 @@ CREATE INDEX IF NOT EXISTS idx_inventory_allocations_variant
   `);
 
   console.log('PostgreSQL tables initialized successfully');
+  await pool.query(`
+    ALTER TABLE products
+      ADD COLUMN IF NOT EXISTS current_wholesale_total_tjs NUMERIC(14,2) NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS current_cargo_total_tjs NUMERIC(14,2) NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS current_sale_price_tjs NUMERIC(14,2) NOT NULL DEFAULT 0
+  `);
+
 }
 
 app.use(cors());
@@ -377,10 +387,10 @@ app.get('/api/products', async (req, res) => {
         ), 0)::INTEGER AS quantity,
 
         latest.unit_cost_tjs AS "unitCostTjs",
-        latest.current_sale_price_tjs AS "salePriceTjs",
-        latest.wholesale_total_tjs AS "totalWholesaleTjs",
+        COALESCE(latest.current_sale_price_tjs, p.current_sale_price_tjs, 0) AS "salePriceTjs",
+        COALESCE(latest.wholesale_total_tjs, p.current_wholesale_total_tjs, 0) AS "totalWholesaleTjs",
         latest.wholesale_currency AS "wholesaleCurrency",
-        latest.cargo_total_tjs AS "cargoCostTjs",
+        COALESCE(latest.cargo_total_tjs, p.current_cargo_total_tjs, 0) AS "cargoCostTjs",
         latest.cargo_currency AS "cargoCurrency"
 
       FROM products p
@@ -422,50 +432,58 @@ app.get('/api/products', async (req, res) => {
 // =========================================
 
 app.put('/api/products/:id', async (req, res) => {
+  const { id } = req.params;
+  const { title, photo, totalWholesaleTjs, cargoCostTjs, salePriceTjs } = req.body;
+  const prices = [totalWholesaleTjs, cargoCostTjs, salePriceTjs];
+  if (typeof title !== 'string' || !title.trim() || title.length > 250) {
+    return res.status(400).json({ success: false, error: 'Название товара обязательно (до 250 символов)' });
+  }
+  if (!prices.every(value => value !== undefined && Number.isFinite(Number(value)) && Number(value) >= 0)) {
+    return res.status(400).json({ success: false, error: 'Проверьте закупочную стоимость, карго и цену продажи' });
+  }
+
+  const client = await pool.connect();
   try {
-    const { id } = req.params;
-    const { title, photo } = req.body;
-
-    if (!title || !title.trim()) {
-      return res.status(400).json({
-        success: false,
-        error: 'Название товара обязательно'
-      });
-    }
-
-    const result = await pool.query(
+    await client.query('BEGIN');
+    const result = await client.query(
       `UPDATE products
-       SET title = $1,
-           photo = $2
-       WHERE id = $3
-         AND is_active = TRUE
+       SET title = $1, photo = $2,
+           current_wholesale_total_tjs = $3,
+           current_cargo_total_tjs = $4,
+           current_sale_price_tjs = $5
+       WHERE id = $6 AND is_active = TRUE
        RETURNING id, title, photo`,
-      [
-        title.trim(),
-        photo || '',
-        id
-      ]
+      [title.trim(), photo || '', Number(totalWholesaleTjs), Number(cargoCostTjs), Number(salePriceTjs), id]
     );
-
     if (result.rowCount === 0) {
-      return res.status(404).json({
-        success: false,
-        error: 'Товар не найден'
-      });
+      await client.query('ROLLBACK');
+      return res.status(404).json({ success: false, error: 'Товар не найден' });
     }
-
-    return res.json({
-      success: true,
-      product: result.rows[0]
-    });
-
+    const latest = await client.query(
+      `SELECT id, initial_quantity FROM purchase_batch_items
+       WHERE product_id = $1 ORDER BY created_at DESC LIMIT 1 FOR UPDATE`,
+      [id]
+    );
+    if (latest.rowCount > 0) {
+      const quantity = Number(latest.rows[0].initial_quantity) || 1;
+      const wholesale = Number(totalWholesaleTjs);
+      const cargo = Number(cargoCostTjs);
+      await client.query(
+        `UPDATE purchase_batch_items
+         SET wholesale_total_tjs = $2, cargo_total_tjs = $3,
+             unit_cost_tjs = $4, current_sale_price_tjs = $5
+         WHERE id = $1`,
+        [latest.rows[0].id, wholesale, cargo, (wholesale + cargo) / quantity, Number(salePriceTjs)]
+      );
+    }
+    await client.query('COMMIT');
+    return res.json({ success: true, product: result.rows[0] });
   } catch (error) {
+    await client.query('ROLLBACK');
     console.error('Update product error:', error);
-
-    return res.status(500).json({
-      success: false,
-      error: 'Не удалось обновить товар'
-    });
+    return res.status(500).json({ success: false, error: 'Не удалось обновить товар' });
+  } finally {
+    client.release();
   }
 });
 
