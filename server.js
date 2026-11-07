@@ -233,7 +233,7 @@ CREATE INDEX IF NOT EXISTS idx_inventory_allocations_variant
 
 app.use(cors());
 
-app.use(express.json());
+app.use(express.json({ limit: '25mb' }));
 
 // Сообщения из чата поддержки Mekha Shop отправляются администратору в Telegram.
 const SUPPORT_CHAT_ID = '907176273';
