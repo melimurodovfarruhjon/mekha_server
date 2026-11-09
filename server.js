@@ -87,7 +87,9 @@ async function initializeDatabase() {
 
     ALTER TABLE orders
       ADD COLUMN IF NOT EXISTS client_latitude DOUBLE PRECISION,
-      ADD COLUMN IF NOT EXISTS client_longitude DOUBLE PRECISION;
+      ADD COLUMN IF NOT EXISTS client_longitude DOUBLE PRECISION,
+      ADD COLUMN IF NOT EXISTS store_latitude DOUBLE PRECISION,
+      ADD COLUMN IF NOT EXISTS store_longitude DOUBLE PRECISION;
 
     CREATE TABLE IF NOT EXISTS order_items (
       id BIGSERIAL PRIMARY KEY,
@@ -429,6 +431,8 @@ app.get('/api/courier/orders', requireCourierAppToken, async (req, res) => {
          o.client_address AS "clientAddress",
          o.client_latitude AS "clientLatitude",
          o.client_longitude AS "clientLongitude",
+         o.store_latitude AS "storeLatitude",
+         o.store_longitude AS "storeLongitude",
          o.comment,
          o.status,
          o.created_at AS "createdAt",
@@ -1383,6 +1387,8 @@ app.post('/api/orders', async (req, res) => {
     clientAddress,
     clientLatitude,
     clientLongitude,
+    storeLatitude,
+    storeLongitude,
     comment,
     items
   } = req.body;
@@ -1419,6 +1425,25 @@ app.post('/api/orders', async (req, res) => {
     return res.status(400).json({
       error: 'Некорректные координаты адреса'
     });
+  }
+
+  const hasStoreLatitude = storeLatitude !== undefined && storeLatitude !== null;
+  const hasStoreLongitude = storeLongitude !== undefined && storeLongitude !== null;
+  const storeLatitudeValue = hasStoreLatitude ? Number(storeLatitude) : null;
+  const storeLongitudeValue = hasStoreLongitude ? Number(storeLongitude) : null;
+
+  if (
+    hasStoreLatitude !== hasStoreLongitude ||
+    (hasStoreLatitude && (
+      String(storeLatitude).trim() === '' ||
+      String(storeLongitude).trim() === '' ||
+      !Number.isFinite(storeLatitudeValue) ||
+      !Number.isFinite(storeLongitudeValue) ||
+      storeLatitudeValue < 38.40 || storeLatitudeValue > 38.75 ||
+      storeLongitudeValue < 68.55 || storeLongitudeValue > 69.05
+    ))
+  ) {
+    return res.status(400).json({ error: 'Некорректные координаты магазина' });
   }
 
   const validItems = items.every(item =>
@@ -1478,8 +1503,9 @@ try {
     await client.query(
       `INSERT INTO orders (
        id, public_number, courier_name, courier_chat_id,
-       client_phone, client_address, client_latitude, client_longitude, comment
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+       client_phone, client_address, client_latitude, client_longitude,
+       store_latitude, store_longitude, comment
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
       [
         orderId,
         publicNumber,
@@ -1489,6 +1515,8 @@ try {
         clientAddress || null,
         clientLatitude == null ? null : Number(clientLatitude),
         clientLongitude == null ? null : Number(clientLongitude),
+        storeLatitude == null ? null : Number(storeLatitude),
+        storeLongitude == null ? null : Number(storeLongitude),
         comment || null
       ]
     );
