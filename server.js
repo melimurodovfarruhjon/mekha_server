@@ -55,6 +55,8 @@ async function initializeDatabase() {
       courier_chat_id TEXT NOT NULL,
       client_phone TEXT,
       client_address TEXT,
+      client_latitude DOUBLE PRECISION,
+      client_longitude DOUBLE PRECISION,
       comment TEXT,
       status TEXT NOT NULL DEFAULT 'pending',
       return_reason TEXT,
@@ -68,6 +70,10 @@ async function initializeDatabase() {
       CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_active_public_number
       ON orders(public_number)
       WHERE status = 'pending';
+
+    ALTER TABLE orders
+      ADD COLUMN IF NOT EXISTS client_latitude DOUBLE PRECISION,
+      ADD COLUMN IF NOT EXISTS client_longitude DOUBLE PRECISION;
 
     CREATE TABLE IF NOT EXISTS order_items (
       id BIGSERIAL PRIMARY KEY,
@@ -1176,6 +1182,8 @@ app.post('/api/orders', async (req, res) => {
     courierChatId,
     clientPhone,
     clientAddress,
+    clientLatitude,
+    clientLongitude,
     comment,
     items
   } = req.body;
@@ -1190,6 +1198,25 @@ app.post('/api/orders', async (req, res) => {
   ) {
     return res.status(400).json({
       error: 'Некорректные данные заказа'
+    });
+  }
+
+  const hasLatitude = clientLatitude !== undefined && clientLatitude !== null;
+  const hasLongitude = clientLongitude !== undefined && clientLongitude !== null;
+  const latitudeValue = hasLatitude ? Number(clientLatitude) : null;
+  const longitudeValue = hasLongitude ? Number(clientLongitude) : null;
+
+  if (
+    hasLatitude !== hasLongitude ||
+    (hasLatitude && (
+      !Number.isFinite(latitudeValue) ||
+      !Number.isFinite(longitudeValue) ||
+      latitudeValue < -90 || latitudeValue > 90 ||
+      longitudeValue < -180 || longitudeValue > 180
+    ))
+  ) {
+    return res.status(400).json({
+      error: 'Некорректные координаты адреса'
     });
   }
 
@@ -1250,8 +1277,8 @@ try {
     await client.query(
       `INSERT INTO orders (
        id, public_number, courier_name, courier_chat_id,
-       client_phone, client_address, comment
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+       client_phone, client_address, client_latitude, client_longitude, comment
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
       [
         orderId,
         publicNumber,
@@ -1259,6 +1286,8 @@ try {
         String(courierChatId),
         clientPhone || null,
         clientAddress || null,
+        clientLatitude == null ? null : Number(clientLatitude),
+        clientLongitude == null ? null : Number(clientLongitude),
         comment || null
       ]
     );
