@@ -1209,6 +1209,8 @@ app.post('/api/orders', async (req, res) => {
   if (
     hasLatitude !== hasLongitude ||
     (hasLatitude && (
+      String(clientLatitude).trim() === '' ||
+      String(clientLongitude).trim() === '' ||
       !Number.isFinite(latitudeValue) ||
       !Number.isFinite(longitudeValue) ||
       latitudeValue < -90 || latitudeValue > 90 ||
