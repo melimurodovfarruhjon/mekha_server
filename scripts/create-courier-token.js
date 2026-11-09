@@ -10,7 +10,7 @@ if (!process.env.DATABASE_URL) {
   console.error('DATABASE_URL is not configured.');
   process.exit(1);
 }
-if (!/^\\d{5,20}$/.test(courierChatId)) {
+if (!/^\d{5,20}$/.test(courierChatId)) {
   console.error('Usage: npm run create:courier-token -- <telegram_chat_id> <courier_name>');
   process.exit(1);
 }
