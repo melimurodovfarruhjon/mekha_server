@@ -140,6 +140,22 @@ ADD COLUMN IF NOT EXISTS frontend_processed_at TIMESTAMPTZ;
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
+    CREATE TABLE IF NOT EXISTS store_locations (
+      id SMALLINT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+      latitude DOUBLE PRECISION NOT NULL CHECK (latitude BETWEEN -90 AND 90),
+      longitude DOUBLE PRECISION NOT NULL CHECK (longitude BETWEEN -180 AND 180),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS geocode_cache (
+      normalized_address TEXT PRIMARY KEY,
+      latitude DOUBLE PRECISION NOT NULL,
+      longitude DOUBLE PRECISION NOT NULL,
+      display_name TEXT NOT NULL,
+      provider TEXT NOT NULL DEFAULT 'photon',
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
     
 -- =========================================
 -- MEKHA SHOP: PROCUREMENT AND INVENTORY
@@ -274,6 +290,104 @@ CREATE INDEX IF NOT EXISTS idx_inventory_allocations_variant
 app.use(cors());
 
 app.use(express.json({ limit: '25mb' }));
+
+// Map services are proxied through the backend so providers can be changed
+// without releasing new mobile builds. Public endpoints are MVP defaults only.
+const GEOCODER_BASE_URL = process.env.GEOCODER_BASE_URL || 'https://photon.komoot.io';
+const ROUTING_BASE_URL = process.env.ROUTING_BASE_URL || 'https://router.project-osrm.org';
+const mapRequestWindows = new Map();
+
+function allowMapRequest(req, res, next) {
+  const key = req.ip || req.socket.remoteAddress || 'unknown';
+  const now = Date.now();
+  const recent = (mapRequestWindows.get(key) || []).filter((time) => now - time < 60000);
+  if (recent.length >= 20) {
+    return res.status(429).json({ success: false, error: 'Слишком много запросов к картам. Повторите позже.' });
+  }
+  recent.push(now);
+  mapRequestWindows.set(key, recent);
+  return next();
+}
+
+app.get('/api/maps/geocode', allowMapRequest, async (req, res) => {
+  const address = typeof req.query.address === 'string' ? req.query.address.trim() : '';
+  if (address.length < 5 || address.length > 300) {
+    return res.status(400).json({ success: false, error: 'Укажите адрес длиной от 5 до 300 символов.' });
+  }
+
+  const query = /душанбе|dushanbe/i.test(address) ? address : `${address}, Душанбе, Таджикистан`;
+  try {
+    const url = new URL('/api/', GEOCODER_BASE_URL);
+    url.searchParams.set('q', query);
+    url.searchParams.set('limit', '5');
+    url.searchParams.set('lang', 'ru');
+    const response = await fetch(url, {
+      headers: { 'Accept': 'application/json', 'User-Agent': 'ZudGo-MekhaShop/1.0' },
+      signal: AbortSignal.timeout(12000)
+    });
+    if (!response.ok) throw new Error(`Geocoder HTTP ${response.status}`);
+    const data = await response.json();
+    const results = (data.features || []).map((feature) => {
+      const coordinates = feature.geometry?.coordinates || [];
+      const properties = feature.properties || {};
+      return {
+        longitude: Number(coordinates[0]),
+        latitude: Number(coordinates[1]),
+        label: [properties.name, properties.street, properties.housenumber, properties.district, properties.city, properties.country]
+          .filter(Boolean).join(', ')
+      };
+    }).filter((item) =>
+      Number.isFinite(item.latitude) && Number.isFinite(item.longitude) &&
+      item.latitude >= 38.40 && item.latitude <= 38.75 &&
+      item.longitude >= 68.55 && item.longitude <= 69.05
+    );
+    return res.json({ success: true, results });
+  } catch (error) {
+    console.error('Address geocoding failed:', error.message);
+    return res.status(502).json({ success: false, error: 'Сервис поиска адреса временно недоступен.' });
+  }
+});
+
+app.get('/api/maps/route', allowMapRequest, async (req, res) => {
+  const raw = typeof req.query.coordinates === 'string' ? req.query.coordinates : '';
+  const pairs = raw.split(';');
+  if (pairs.length < 2 || pairs.length > 10) {
+    return res.status(400).json({ success: false, error: 'Для маршрута нужны от 2 до 10 точек.' });
+  }
+
+  const coordinates = pairs.map((pair) => pair.split(',').map(Number));
+  const valid = coordinates.every((pair) =>
+    pair.length === 2 && Number.isFinite(pair[0]) && Number.isFinite(pair[1]) &&
+    pair[0] >= 68.55 && pair[0] <= 69.05 && pair[1] >= 38.40 && pair[1] <= 38.75
+  );
+  if (!valid) {
+    return res.status(400).json({ success: false, error: 'Координаты должны находиться в зоне обслуживания Душанбе.' });
+  }
+
+  try {
+    const url = new URL(`/route/v1/driving/${coordinates.map((pair) => pair.join(',')).join(';')}`, ROUTING_BASE_URL);
+    url.searchParams.set('overview', 'full');
+    url.searchParams.set('geometries', 'geojson');
+    url.searchParams.set('steps', 'true');
+    const response = await fetch(url, { signal: AbortSignal.timeout(15000) });
+    if (!response.ok) throw new Error(`Router HTTP ${response.status}`);
+    const data = await response.json();
+    if (data.code !== 'Ok' || !data.routes?.length) {
+      return res.status(404).json({ success: false, error: 'Маршрут по дорожной сети не найден.' });
+    }
+    const route = data.routes[0];
+    return res.json({
+      success: true,
+      distanceMeters: route.distance,
+      durationSeconds: route.duration,
+      geometry: route.geometry,
+      legs: route.legs
+    });
+  } catch (error) {
+    console.error('Route calculation failed:', error.message);
+    return res.status(502).json({ success: false, error: 'Сервис маршрутизации временно недоступен.' });
+  }
+});
 
 // Mobile courier authentication: each installation uses its own revocable token.
 async function requireCourierAppToken(req, res, next) {
