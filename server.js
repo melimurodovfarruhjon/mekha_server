@@ -3,7 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const webpush = require('web-push');
 const { Pool } = require('pg');
-const { randomUUID } = require('crypto');
+const { randomUUID, createHash } = require('crypto');
 
 const TOKEN = process.env.BOT_TOKEN;
 
@@ -70,6 +70,20 @@ async function initializeDatabase() {
       CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_active_public_number
       ON orders(public_number)
       WHERE status = 'pending';
+
+    CREATE TABLE IF NOT EXISTS courier_app_tokens (
+      id BIGSERIAL PRIMARY KEY,
+      token_hash CHAR(64) NOT NULL UNIQUE,
+      courier_chat_id TEXT NOT NULL,
+      courier_name TEXT NOT NULL,
+      is_active BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      revoked_at TIMESTAMPTZ
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_courier_app_tokens_chat
+      ON courier_app_tokens(courier_chat_id)
+      WHERE is_active = TRUE;
 
     ALTER TABLE orders
       ADD COLUMN IF NOT EXISTS client_latitude DOUBLE PRECISION,
@@ -260,6 +274,77 @@ CREATE INDEX IF NOT EXISTS idx_inventory_allocations_variant
 app.use(cors());
 
 app.use(express.json({ limit: '25mb' }));
+
+// Mobile courier authentication: each installation uses its own revocable token.
+async function requireCourierAppToken(req, res, next) {
+  const authorization = req.get('authorization') || '';
+  const match = authorization.match(/^Bearer ([A-Za-z0-9_-]{40,100})$/);
+  if (!match) {
+    return res.status(401).json({ success: false, error: 'Требуется авторизация курьера' });
+  }
+
+  const tokenHash = createHash('sha256').update(match[1], 'utf8').digest('hex');
+  try {
+    const result = await pool.query(
+      `SELECT courier_chat_id AS "courierChatId",
+              courier_name AS "courierName"
+       FROM courier_app_tokens
+       WHERE token_hash = $1 AND is_active = TRUE
+       LIMIT 1`,
+      [tokenHash]
+    );
+    if (!result.rows[0]) {
+      return res.status(401).json({ success: false, error: 'Токен недействителен или отозван' });
+    }
+    req.courier = result.rows[0];
+    return next();
+  } catch (error) {
+    console.error('Courier authentication failed:', error.message);
+    return res.status(500).json({ success: false, error: 'Не удалось проверить авторизацию' });
+  }
+}
+
+// Return only pending orders assigned to the authenticated Telegram courier identity.
+app.get('/api/courier/orders', requireCourierAppToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT
+         o.id,
+         o.public_number AS "publicNumber",
+         o.client_phone AS "clientPhone",
+         o.client_address AS "clientAddress",
+         o.client_latitude AS "clientLatitude",
+         o.client_longitude AS "clientLongitude",
+         o.comment,
+         o.status,
+         o.created_at AS "createdAt",
+         COALESCE(
+           json_agg(
+             json_build_object(
+               'title', oi.title,
+               'quantity', oi.quantity,
+               'photo', oi.photo
+             ) ORDER BY oi.id
+           ) FILTER (WHERE oi.id IS NOT NULL),
+           '[]'::json
+         ) AS items
+       FROM orders o
+       LEFT JOIN order_items oi ON oi.order_id = o.id
+       WHERE o.courier_chat_id = $1 AND o.status = 'pending'
+       GROUP BY o.id
+       ORDER BY o.created_at ASC`,
+      [req.courier.courierChatId]
+    );
+    return res.json({
+      success: true,
+      courier: { name: req.courier.courierName },
+      orders: result.rows
+    });
+  } catch (error) {
+    console.error('Courier orders fetch failed:', error.message);
+    return res.status(500).json({ success: false, error: 'Не удалось загрузить заказы' });
+  }
+});
 
 // Сообщения из чата поддержки Mekha Shop отправляются администратору в Telegram.
 const SUPPORT_CHAT_ID = '907176273';
