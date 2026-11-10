@@ -1628,6 +1628,45 @@ try {
     `${comment ? `💬 Комментарий: ${comment}\n` : ''}\n` +
     `Пожалуйста, подтвердите статус кнопкой ниже.`;
 
+  if (!courierChatId) {
+    if (!firebaseAdminReady) {
+      return res.status(503).json({ success: false, orderId, publicNumber, saved: true,
+        error: 'Заказ сохранён, но Firebase Admin SDK не инициализирован на сервере' });
+    }
+    try {
+      const devices = await pool.query('SELECT id, fcm_token FROM courier_test_devices WHERE is_active = TRUE');
+      if (!devices.rows.length) {
+        return res.status(409).json({ success: false, orderId, publicNumber, saved: true,
+          error: 'Устройство ZudGo ещё не зарегистрировано. Откройте приложение и повторите отправку.' });
+      }
+      const title = `Новый заказ №${publicNumber}`;
+      const body = items.map(item => `${item.title} × ${Number(item.qty)}`).join(', ').slice(0, 160);
+      const results = await Promise.allSettled(devices.rows.map(async device => {
+        try {
+          await admin.messaging().send({
+            token: device.fcm_token,
+            notification: { title, body: body || 'Новый заказ ожидает вас' },
+            data: { type: 'courier_order', orderId, publicNumber: String(publicNumber) },
+            android: { priority: 'high', notification: { channelId: 'zudgo_orders', sound: 'default' } }
+          });
+        } catch (error) {
+          if (['messaging/registration-token-not-registered', 'messaging/invalid-registration-token'].includes(error.code)) {
+            await pool.query('UPDATE courier_test_devices SET is_active = FALSE WHERE id = $1', [device.id]);
+          }
+          throw error;
+        }
+      }));
+      const delivered = results.filter(result => result.status === 'fulfilled').length;
+      if (!delivered) throw new Error('Firebase не принял push ни для одного устройства');
+      return res.status(201).json({ success: true, orderId, publicNumber, status: 'pending',
+        pushSent: delivered, message: 'Заказ отправлен в ZudGo' });
+    } catch (error) {
+      console.error('FCM courier push failed:', error.message);
+      return res.status(502).json({ success: false, orderId, publicNumber, saved: true,
+        error: 'Заказ сохранён, но push не доставлен: ' + error.message });
+    }
+  }
+
   try {
     const telegramMessage = await bot.telegram.sendMessage(
       String(courierChatId),
