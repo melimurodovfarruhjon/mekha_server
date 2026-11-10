@@ -476,7 +476,7 @@ app.get('/api/courier/test-device/orders', async (req, res) => {
     const result = await pool.query(`SELECT o.id, o.public_number AS "publicNumber",
       o.client_phone AS "clientPhone", o.client_address AS "clientAddress",
       o.client_latitude AS "clientLatitude", o.client_longitude AS "clientLongitude",
-      o.store_latitude AS "storeLatitude", o.store_longitude AS "storeLongitude",
+      o.store_address AS "storeAddress", o.store_latitude AS "storeLatitude", o.store_longitude AS "storeLongitude",
       o.comment, o.status, o.created_at AS "createdAt",
       COALESCE(json_agg(json_build_object('title', oi.title, 'quantity', oi.quantity, 'photo', oi.photo)
       ORDER BY oi.id) FILTER (WHERE oi.id IS NOT NULL), '[]'::json) AS items
