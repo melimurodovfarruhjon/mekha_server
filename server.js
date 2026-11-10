@@ -98,6 +98,8 @@ async function initializeDatabase() {
       ON courier_app_tokens(courier_chat_id)
       WHERE is_active = TRUE;
 
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS store_address TEXT;
+
     CREATE TABLE IF NOT EXISTS courier_test_devices (
       id BIGSERIAL PRIMARY KEY,
       token_hash CHAR(64) NOT NULL UNIQUE,
@@ -1453,6 +1455,7 @@ app.post('/api/orders', async (req, res) => {
     courierChatId,
     clientPhone,
     clientAddress,
+    storeAddress,
     clientLatitude,
     clientLongitude,
     storeLatitude,
@@ -1473,16 +1476,49 @@ app.post('/api/orders', async (req, res) => {
     });
   }
 
-  const hasLatitude = clientLatitude !== undefined && clientLatitude !== null;
-  const hasLongitude = clientLongitude !== undefined && clientLongitude !== null;
-  const latitudeValue = hasLatitude ? Number(clientLatitude) : null;
-  const longitudeValue = hasLongitude ? Number(clientLongitude) : null;
+  const resolveAddress = async (address) => {
+    const query = /душанбе|dushanbe/i.test(address) ? address : address + ', Душанбе, Таджикистан';
+    const url = new URL('/api/', GEOCODER_BASE_URL);
+    url.searchParams.set('q', query); url.searchParams.set('limit', '1'); url.searchParams.set('lang', 'ru');
+    const response = await fetch(url, { headers: { Accept: 'application/json', 'User-Agent': 'ZudGo-MekhaShop/1.0' }, signal: AbortSignal.timeout(12000) });
+    if (!response.ok) throw new Error('Geocoder HTTP ' + response.status);
+    const data = await response.json();
+    const feature = (data.features || []).find((item) => {
+      const coords = item.geometry && item.geometry.coordinates ? item.geometry.coordinates : [];
+      const longitude = Number(coords[0]), latitude = Number(coords[1]);
+      return Number.isFinite(latitude) && Number.isFinite(longitude) && latitude >= 38.40 && latitude <= 38.75 && longitude >= 68.55 && longitude <= 69.05;
+    });
+    if (!feature) throw new Error('Не удалось определить координаты адреса: ' + address);
+    return { latitude: Number(feature.geometry.coordinates[1]), longitude: Number(feature.geometry.coordinates[0]) };
+  };
+  let resolvedClientLatitude = clientLatitude == null ? null : Number(clientLatitude);
+  let resolvedClientLongitude = clientLongitude == null ? null : Number(clientLongitude);
+  let resolvedStoreLatitude = storeLatitude == null ? null : Number(storeLatitude);
+  let resolvedStoreLongitude = storeLongitude == null ? null : Number(storeLongitude);
+  try {
+    if ((resolvedClientLatitude == null || resolvedClientLongitude == null) && clientAddress) {
+      const point = await resolveAddress(clientAddress); resolvedClientLatitude = point.latitude; resolvedClientLongitude = point.longitude;
+    }
+    if ((resolvedStoreLatitude == null || resolvedStoreLongitude == null) && storeAddress) {
+      const point = await resolveAddress(storeAddress); resolvedStoreLatitude = point.latitude; resolvedStoreLongitude = point.longitude;
+    }
+  } catch (error) {
+    return res.status(422).json({ success: false, error: error.message || 'Не удалось преобразовать адреса в координаты.' });
+  }
+  if (resolvedClientLatitude == null || resolvedClientLongitude == null || resolvedStoreLatitude == null || resolvedStoreLongitude == null) {
+    return res.status(400).json({ success: false, error: 'Укажите адрес клиента и адрес магазина.' });
+  }
+
+  const hasLatitude = resolvedClientLatitude !== undefined && resolvedClientLatitude !== null;
+  const hasLongitude = resolvedClientLongitude !== undefined && resolvedClientLongitude !== null;
+  const latitudeValue = hasLatitude ? Number(resolvedClientLatitude) : null;
+  const longitudeValue = hasLongitude ? Number(resolvedClientLongitude) : null;
 
   if (
     hasLatitude !== hasLongitude ||
     (hasLatitude && (
-      String(clientLatitude).trim() === '' ||
-      String(clientLongitude).trim() === '' ||
+      String(resolvedClientLatitude).trim() === '' ||
+      String(resolvedClientLongitude).trim() === '' ||
       !Number.isFinite(latitudeValue) ||
       !Number.isFinite(longitudeValue) ||
       latitudeValue < -90 || latitudeValue > 90 ||
@@ -1494,16 +1530,16 @@ app.post('/api/orders', async (req, res) => {
     });
   }
 
-  const hasStoreLatitude = storeLatitude !== undefined && storeLatitude !== null;
-  const hasStoreLongitude = storeLongitude !== undefined && storeLongitude !== null;
-  const storeLatitudeValue = hasStoreLatitude ? Number(storeLatitude) : null;
-  const storeLongitudeValue = hasStoreLongitude ? Number(storeLongitude) : null;
+  const hasStoreLatitude = resolvedStoreLatitude !== undefined && resolvedStoreLatitude !== null;
+  const hasStoreLongitude = resolvedStoreLongitude !== undefined && resolvedStoreLongitude !== null;
+  const storeLatitudeValue = hasStoreLatitude ? Number(resolvedStoreLatitude) : null;
+  const storeLongitudeValue = hasStoreLongitude ? Number(resolvedStoreLongitude) : null;
 
   if (
     hasStoreLatitude !== hasStoreLongitude ||
     (hasStoreLatitude && (
-      String(storeLatitude).trim() === '' ||
-      String(storeLongitude).trim() === '' ||
+      String(resolvedStoreLatitude).trim() === '' ||
+      String(resolvedStoreLongitude).trim() === '' ||
       !Number.isFinite(storeLatitudeValue) ||
       !Number.isFinite(storeLongitudeValue) ||
       storeLatitudeValue < 38.40 || storeLatitudeValue > 38.75 ||
@@ -1571,8 +1607,8 @@ try {
       `INSERT INTO orders (
        id, public_number, courier_name, courier_chat_id,
        client_phone, client_address, client_latitude, client_longitude,
-       store_latitude, store_longitude, comment
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+       store_address, store_latitude, store_longitude, comment
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
       [
         orderId,
         publicNumber,
@@ -1580,10 +1616,11 @@ try {
         courierChatId ? String(courierChatId) : 'zudgo-test-device',
         clientPhone || null,
         clientAddress || null,
-        clientLatitude == null ? null : Number(clientLatitude),
-        clientLongitude == null ? null : Number(clientLongitude),
-        storeLatitude == null ? null : Number(storeLatitude),
-        storeLongitude == null ? null : Number(storeLongitude),
+        resolvedClientLatitude,
+        resolvedClientLongitude,
+        storeAddress || null,
+        resolvedStoreLatitude,
+        resolvedStoreLongitude,
         comment || null
       ]
     );
