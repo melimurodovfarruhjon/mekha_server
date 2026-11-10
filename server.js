@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const webpush = require('web-push');
 const { Pool } = require('pg');
+const admin = require('firebase-admin');
 const { randomUUID, createHash } = require('crypto');
 
 const TOKEN = process.env.BOT_TOKEN;
@@ -12,6 +13,18 @@ if (!TOKEN) {
 }
 
 const bot = new Telegraf(TOKEN);
+let firebaseAdminReady = false;
+try {
+  if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+    admin.initializeApp({ credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)) });
+    firebaseAdminReady = true;
+    console.log('Firebase Admin SDK initialized');
+  } else {
+    console.warn('FIREBASE_SERVICE_ACCOUNT is missing; courier push disabled');
+  }
+} catch (error) {
+  console.error('Firebase Admin initialization failed:', error.message);
+}
 const app = express();
 
 const WEBHOOK_URL = process.env.WEBHOOK_URL;
@@ -84,6 +97,16 @@ async function initializeDatabase() {
     CREATE INDEX IF NOT EXISTS idx_courier_app_tokens_chat
       ON courier_app_tokens(courier_chat_id)
       WHERE is_active = TRUE;
+
+    CREATE TABLE IF NOT EXISTS courier_test_devices (
+      id BIGSERIAL PRIMARY KEY,
+      token_hash CHAR(64) NOT NULL UNIQUE,
+      fcm_token TEXT NOT NULL,
+      device_name TEXT NOT NULL DEFAULT 'ZudGo test device',
+      is_active BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
 
     ALTER TABLE orders
       ADD COLUMN IF NOT EXISTS client_latitude DOUBLE PRECISION,
@@ -419,6 +442,51 @@ async function requireCourierAppToken(req, res, next) {
     return res.status(500).json({ success: false, error: 'Не удалось проверить авторизацию' });
   }
 }
+
+// Temporary test-device registration; replace with courier accounts after first end-to-end test.
+app.post('/api/courier/test-device/register', async (req, res) => {
+  const { fcmToken, deviceName } = req.body || {};
+  if (typeof fcmToken !== 'string' || fcmToken.length < 40 || fcmToken.length > 4096) {
+    return res.status(400).json({ success: false, error: 'Некорректный FCM-токен устройства' });
+  }
+  try {
+    const tokenHash = createHash('sha256').update(fcmToken, 'utf8').digest('hex');
+    await pool.query(`INSERT INTO courier_test_devices (token_hash, fcm_token, device_name, is_active, updated_at)
+      VALUES ($1, $2, $3, TRUE, NOW())
+      ON CONFLICT (token_hash) DO UPDATE SET fcm_token = EXCLUDED.fcm_token,
+      device_name = EXCLUDED.device_name, is_active = TRUE, updated_at = NOW()`,
+      [tokenHash, fcmToken, typeof deviceName === 'string' ? deviceName.slice(0, 80) : 'ZudGo test device']);
+    return res.json({ success: true, registered: true });
+  } catch (error) {
+    console.error('Test device registration failed:', error.message);
+    return res.status(500).json({ success: false, error: 'Не удалось зарегистрировать устройство' });
+  }
+});
+
+app.get('/api/courier/test-device/orders', async (req, res) => {
+  const authorization = req.get('authorization') || '';
+  const fcmToken = authorization.startsWith('Bearer ') ? authorization.slice(7) : '';
+  if (!fcmToken || fcmToken.length > 4096) return res.status(401).json({ success: false, error: 'Требуется токен устройства' });
+  try {
+    const tokenHash = createHash('sha256').update(fcmToken, 'utf8').digest('hex');
+    const device = await pool.query('SELECT id FROM courier_test_devices WHERE token_hash = $1 AND is_active = TRUE LIMIT 1', [tokenHash]);
+    if (!device.rows[0]) return res.status(401).json({ success: false, error: 'Устройство не зарегистрировано' });
+    const result = await pool.query(`SELECT o.id, o.public_number AS "publicNumber",
+      o.client_phone AS "clientPhone", o.client_address AS "clientAddress",
+      o.client_latitude AS "clientLatitude", o.client_longitude AS "clientLongitude",
+      o.store_latitude AS "storeLatitude", o.store_longitude AS "storeLongitude",
+      o.comment, o.status, o.created_at AS "createdAt",
+      COALESCE(json_agg(json_build_object('title', oi.title, 'quantity', oi.quantity, 'photo', oi.photo)
+      ORDER BY oi.id) FILTER (WHERE oi.id IS NOT NULL), '[]'::json) AS items
+      FROM orders o LEFT JOIN order_items oi ON oi.order_id = o.id
+      WHERE o.status = 'pending' AND o.courier_chat_id = 'zudgo-test-device'
+      GROUP BY o.id ORDER BY o.created_at ASC`);
+    return res.json({ success: true, orders: result.rows });
+  } catch (error) {
+    console.error('Test device orders fetch failed:', error.message);
+    return res.status(500).json({ success: false, error: 'Не удалось загрузить заказы' });
+  }
+});
 
 // Return only pending orders assigned to the authenticated Telegram courier identity.
 app.get('/api/courier/orders', requireCourierAppToken, async (req, res) => {
@@ -1396,7 +1464,6 @@ app.post('/api/orders', async (req, res) => {
   if (
     typeof courierName !== 'string' ||
     !courierName.trim() ||
-    !courierChatId ||
     !Array.isArray(items) ||
     items.length === 0 ||
     items.length > 100
@@ -1510,7 +1577,7 @@ try {
         orderId,
         publicNumber,
         courierName.trim(),
-        String(courierChatId),
+        courierChatId ? String(courierChatId) : 'zudgo-test-device',
         clientPhone || null,
         clientAddress || null,
         clientLatitude == null ? null : Number(clientLatitude),
