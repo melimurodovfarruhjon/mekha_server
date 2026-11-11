@@ -1747,8 +1747,9 @@ try {
     try {
       const devices = await pool.query('SELECT id, fcm_token FROM courier_test_devices WHERE is_active = TRUE');
       if (!devices.rows.length) {
-        return res.status(409).json({ success: false, orderId, publicNumber, saved: true,
-          error: 'Устройство ZudGo ещё не зарегистрировано. Откройте приложение и повторите отправку.' });
+        console.warn('Order saved; no active ZudGo test device registered. Polling can still deliver it.');
+        return res.status(201).json({ success: true, orderId, publicNumber, status: 'pending',
+          pushSent: 0, pushWarning: 'Устройство пока не зарегистрировано для Push. Заказ сохранён и будет доступен приложению при синхронизации.' });
       }
       const title = `Новый заказ №${publicNumber}`;
       const body = items.map(item => `${item.title} × ${Number(item.qty)}`).join(', ').slice(0, 160);
@@ -1773,8 +1774,8 @@ try {
         pushSent: delivered, message: 'Заказ отправлен в ZudGo' });
     } catch (error) {
       console.error('FCM courier push failed:', error.message);
-      return res.status(502).json({ success: false, orderId, publicNumber, saved: true,
-        error: 'Заказ сохранён, но push не доставлен: ' + error.message });
+      return res.status(201).json({ success: true, orderId, publicNumber, status: 'pending',
+        pushSent: 0, pushWarning: 'Заказ сохранён. Push не доставлен: ' + error.message });
     }
   }
 
