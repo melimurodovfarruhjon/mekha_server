@@ -1741,8 +1741,9 @@ try {
 
   if (!courierChatId) {
     if (!firebaseAdminReady) {
-      return res.status(503).json({ success: false, orderId, publicNumber, saved: true,
-        error: 'Заказ сохранён, но Firebase Admin SDK не инициализирован на сервере' });
+      console.warn('Order saved; Firebase Admin SDK is not configured. Courier polling remains available.');
+      return res.status(201).json({ success: true, orderId, publicNumber, status: 'pending',
+        pushSent: 0, pushWarning: 'Заказ сохранён, но Push пока недоступен: Firebase Admin SDK не настроен на сервере. ZudGo получит заказ при синхронизации.' });
     }
     try {
       const devices = await pool.query('SELECT id, fcm_token FROM courier_test_devices WHERE is_active = TRUE');
