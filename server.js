@@ -523,7 +523,7 @@ app.get('/api/courier/test-device/orders', async (req, res) => {
   }
 });
 
-// Return only pending orders assigned to the authenticated Telegram courier identity.
+// Legacy account endpoint; test-device workflow above is used until courier IDs are introduced.
 
 app.post('/api/courier/test-device/orders/:id/status', async (req, res) => {
   const authorization = req.get('authorization') || '';
@@ -543,9 +543,6 @@ app.post('/api/courier/test-device/orders/:id/status', async (req, res) => {
     );
     if (!device.rows[0]) return res.status(401).json({ success: false, error: 'Устройство не зарегистрировано' });
 
-    const transition = nextStatus === 'picked_up'
-      ? "status = 'pending', picked_up_at = NULL"
-      : "status = 'picked_up', delivered_at = NULL";
     const update = await pool.query(
       `UPDATE orders
        SET status = $1,
