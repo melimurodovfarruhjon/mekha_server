@@ -99,6 +99,13 @@ async function initializeDatabase() {
       WHERE is_active = TRUE;
 
     ALTER TABLE orders ADD COLUMN IF NOT EXISTS store_address TEXT;
+    ALTER TABLE orders
+      ADD COLUMN IF NOT EXISTS picked_up_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS delivered_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS pickup_confirmed_by TEXT;
+    CREATE INDEX IF NOT EXISTS idx_orders_test_device_status
+      ON orders(courier_chat_id, status, created_at);
+
 
     CREATE TABLE IF NOT EXISTS courier_test_devices (
       id BIGSERIAL PRIMARY KEY,
@@ -392,6 +399,32 @@ app.get('/api/maps/route', allowMapRequest, async (req, res) => {
   }
 
   try {
+    if (req.query.mode === 'trip') {
+      const tripUrl = new URL(`/trip/v1/driving/${coordinates.map((pair) => pair.join(',')).join(';')}`, ROUTING_BASE_URL);
+      tripUrl.searchParams.set('roundtrip', 'false');
+      tripUrl.searchParams.set('source', 'first');
+      tripUrl.searchParams.set('destination', 'any');
+      tripUrl.searchParams.set('overview', 'full');
+      tripUrl.searchParams.set('geometries', 'geojson');
+      const tripResponse = await fetch(tripUrl, { signal: AbortSignal.timeout(15000) });
+      if (!tripResponse.ok) throw new Error(`Trip router HTTP ${tripResponse.status}`);
+      const tripData = await tripResponse.json();
+      if (tripData.code !== 'Ok' || !tripData.trips?.length || !tripData.waypoints?.length) {
+        return res.status(404).json({ success: false, error: 'Не удалось оптимизировать порядок остановок.' });
+      }
+      const trip = tripData.trips[0];
+      const orderedWaypoints = tripData.waypoints
+        .map((point, inputIndex) => ({ inputIndex, waypointIndex: point.waypoint_index }))
+        .sort((a, b) => a.waypointIndex - b.waypointIndex);
+      return res.json({
+        success: true,
+        optimized: true,
+        order: orderedWaypoints.map((point) => point.inputIndex),
+        distanceMeters: trip.distance,
+        durationSeconds: trip.duration,
+        geometry: trip.geometry
+      });
+    }
     const url = new URL(`/route/v1/driving/${coordinates.map((pair) => pair.join(',')).join(';')}`, ROUTING_BASE_URL);
     url.searchParams.set('overview', 'full');
     url.searchParams.set('geometries', 'geojson');
@@ -481,7 +514,7 @@ app.get('/api/courier/test-device/orders', async (req, res) => {
       COALESCE(json_agg(json_build_object('title', oi.title, 'quantity', oi.quantity, 'photo', oi.photo)
       ORDER BY oi.id) FILTER (WHERE oi.id IS NOT NULL), '[]'::json) AS items
       FROM orders o LEFT JOIN order_items oi ON oi.order_id = o.id
-      WHERE o.status = 'pending' AND o.courier_chat_id = 'zudgo-test-device'
+      WHERE o.status IN ('pending', 'picked_up') AND o.courier_chat_id = 'zudgo-test-device'
       GROUP BY o.id ORDER BY o.created_at ASC`);
     return res.json({ success: true, orders: result.rows });
   } catch (error) {
@@ -491,6 +524,50 @@ app.get('/api/courier/test-device/orders', async (req, res) => {
 });
 
 // Return only pending orders assigned to the authenticated Telegram courier identity.
+
+app.post('/api/courier/test-device/orders/:id/status', async (req, res) => {
+  const authorization = req.get('authorization') || '';
+  const fcmToken = authorization.startsWith('Bearer ') ? authorization.slice(7) : '';
+  const nextStatus = req.body?.status;
+  if (!fcmToken || fcmToken.length > 4096) {
+    return res.status(401).json({ success: false, error: 'Требуется токен устройства' });
+  }
+  if (!['picked_up', 'delivered'].includes(nextStatus)) {
+    return res.status(400).json({ success: false, error: 'Недопустимый статус заказа' });
+  }
+  try {
+    const tokenHash = createHash('sha256').update(fcmToken, 'utf8').digest('hex');
+    const device = await pool.query(
+      'SELECT id FROM courier_test_devices WHERE token_hash = $1 AND is_active = TRUE LIMIT 1',
+      [tokenHash]
+    );
+    if (!device.rows[0]) return res.status(401).json({ success: false, error: 'Устройство не зарегистрировано' });
+
+    const transition = nextStatus === 'picked_up'
+      ? "status = 'pending', picked_up_at = NULL"
+      : "status = 'picked_up', delivered_at = NULL";
+    const update = await pool.query(
+      `UPDATE orders
+       SET status = $1,
+           picked_up_at = CASE WHEN $1 = 'picked_up' THEN NOW() ELSE picked_up_at END,
+           delivered_at = CASE WHEN $1 = 'delivered' THEN NOW() ELSE delivered_at END,
+           pickup_confirmed_by = CASE WHEN $1 = 'picked_up' THEN 'zudgo-test-device' ELSE pickup_confirmed_by END,
+           updated_at = NOW()
+       WHERE id = $2 AND courier_chat_id = 'zudgo-test-device'
+         AND status = CASE WHEN $1 = 'picked_up' THEN 'pending' ELSE 'picked_up' END
+       RETURNING id, public_number AS "publicNumber", status`,
+      [nextStatus, req.params.id]
+    );
+    if (!update.rows[0]) {
+      return res.status(409).json({ success: false, error: 'Заказ не найден или его статус уже изменён.' });
+    }
+    return res.json({ success: true, order: update.rows[0] });
+  } catch (error) {
+    console.error('Test-device order status update failed:', error.message);
+    return res.status(500).json({ success: false, error: 'Не удалось обновить статус заказа' });
+  }
+});
+
 app.get('/api/courier/orders', requireCourierAppToken, async (req, res) => {
   try {
     const result = await pool.query(
