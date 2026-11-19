@@ -562,7 +562,7 @@ app.get('/api/courier/test-device/orders', async (req, res) => {
       o.client_latitude AS "clientLatitude", o.client_longitude AS "clientLongitude",
       o.store_address AS "storeAddress", o.store_latitude AS "storeLatitude", o.store_longitude AS "storeLongitude",
       o.comment, o.status, o.accepted_at AS "acceptedAt", o.created_at AS "createdAt",
-      COALESCE(json_agg(json_build_object('title', oi.title, 'quantity', oi.quantity, 'photo', oi.photo)
+      COALESCE(json_agg(json_build_object('title', oi.title, 'quantity', oi.quantity)
       ORDER BY oi.id) FILTER (WHERE oi.id IS NOT NULL), '[]'::json) AS items
       FROM orders o LEFT JOIN order_items oi ON oi.order_id = o.id
       WHERE o.status IN ('pending', 'picked_up') AND o.courier_chat_id = 'zudgo-test-device'
@@ -953,7 +953,10 @@ app.get('/api/products', async (req, res) => {
         p.id,
         p.legacy_id AS "legacyId",
         p.title,
-        p.photo,
+        CASE WHEN p.photo LIKE 'data:%'
+          THEN '/api/products/' || p.id || '/photo?v=' || md5(p.photo)
+          ELSE COALESCE(p.photo, '')
+        END AS photo,
 
         COALESCE((
           SELECT SUM(
@@ -994,10 +997,7 @@ app.get('/api/products', async (req, res) => {
       ORDER BY p.created_at DESC
     `);
 
-    return res.json({
-      success: true,
-      products: result.rows
-    });
+    return res.json({ success: true, products: result.rows });
 
   } catch (error) {
     console.error('Products catalog error:', error.message);
@@ -1005,6 +1005,63 @@ app.get('/api/products', async (req, res) => {
     return res.status(500).json({
       error: 'Не удалось загрузить каталог товаров'
     });
+  }
+});
+
+app.get('/api/products/:id/photo', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT photo FROM products WHERE id = $1 AND is_active = TRUE', [req.params.id]);
+    const photo = result.rows[0]?.photo;
+    const match = typeof photo === 'string' && photo.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=]+)$/);
+    if (!match) return res.status(404).end();
+    res.set('Cache-Control', 'public, max-age=31536000, immutable');
+    return res.type(match[1]).send(Buffer.from(match[2], 'base64'));
+  } catch (error) {
+    console.error('Product photo load error:', error.message);
+    return res.status(500).end();
+  }
+});
+
+app.post('/api/products', async (req, res) => {
+  const title = typeof req.body.title === 'string' ? req.body.title.trim() : '';
+  const photo = typeof req.body.photo === 'string' ? req.body.photo : '';
+  const requestedId = typeof req.body.id === 'string' &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(req.body.id)
+    ? req.body.id
+    : null;
+  if (!title || title.length > 250) {
+    return res.status(400).json({ success: false, error: 'Название товара обязательно (до 250 символов)' });
+  }
+  if (req.body.id != null && !requestedId) {
+    return res.status(400).json({ success: false, error: 'Некорректный идентификатор товара' });
+  }
+  if (photo.length > 1_500_000) {
+    return res.status(413).json({ success: false, error: 'Фото слишком большое. Выберите изображение меньшего размера.' });
+  }
+  if (photo && !photo.startsWith('data:image/') && !/^https?:\/\//i.test(photo)) {
+    return res.status(400).json({ success: false, error: 'Некорректный формат фотографии' });
+  }
+  try {
+    const id = requestedId || randomUUID();
+    const result = await pool.query(
+      `INSERT INTO products (id, title, photo) VALUES ($1, $2, $3)
+       ON CONFLICT (id) DO UPDATE SET
+         title = EXCLUDED.title,
+         photo = COALESCE(EXCLUDED.photo, products.photo),
+         is_active = TRUE
+       RETURNING id, title, photo`,
+      [id, title, photo || null]
+    );
+    const created = result.rows[0];
+    const version = created.photo?.startsWith('data:') ? createHash('md5').update(created.photo).digest('hex') : null;
+    return res.status(201).json({ success: true, product: {
+      id: created.id,
+      title: created.title,
+      photo: version ? `/api/products/${created.id}/photo?v=${version}` : created.photo || ''
+    } });
+  } catch (error) {
+    console.error('Product create error:', error.message);
+    return res.status(500).json({ success: false, error: 'Не удалось сохранить товар' });
   }
 });
 
@@ -1028,13 +1085,13 @@ app.put('/api/products/:id', async (req, res) => {
     await client.query('BEGIN');
     const result = await client.query(
       `UPDATE products
-       SET title = $1, photo = $2,
+       SET title = $1, photo = COALESCE($2, photo),
            current_wholesale_total_tjs = $3,
            current_cargo_total_tjs = $4,
            current_sale_price_tjs = $5
        WHERE id = $6 AND is_active = TRUE
        RETURNING id, title, photo`,
-      [title.trim(), photo || '', Number(totalWholesaleTjs), Number(cargoCostTjs), Number(salePriceTjs), id]
+      [title.trim(), typeof photo === 'string' && !photo.includes('/api/products/') ? photo : null, Number(totalWholesaleTjs), Number(cargoCostTjs), Number(salePriceTjs), id]
     );
     if (result.rowCount === 0) {
       await client.query('ROLLBACK');
@@ -1246,7 +1303,10 @@ app.get('/api/purchase-batches', async (req, res) => {
         pb.notes,
         bi.id AS batch_item_id,
         p.title AS product_title,
-        p.photo,
+        CASE WHEN p.photo LIKE 'data:%'
+          THEN '/api/products/' || p.id || '/photo?v=' || md5(p.photo)
+          ELSE COALESCE(p.photo, '')
+        END AS photo,
         bi.initial_quantity,
         COALESCE(vt.sold_quantity, 0)::INTEGER AS sold_quantity,
         GREATEST(
@@ -1325,7 +1385,14 @@ app.get('/api/purchase-batches', async (req, res) => {
 });
 
 app.post('/api/purchase-batches', async (req, res) => {
-  const { items, notes } = req.body;
+  const { items, notes, requestId } = req.body;
+  const requestedBatchId = typeof requestId === 'string' &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(requestId)
+    ? requestId
+    : null;
+  if (requestId != null && !requestedBatchId) {
+    return res.status(400).json({ success: false, error: 'Некорректный идентификатор поставки' });
+  }
 
   if (
     !Array.isArray(items) ||
@@ -1466,18 +1533,38 @@ app.post('/api/purchase-batches', async (req, res) => {
     const legacyId = item.legacyId == null
       ? null
       : String(item.legacyId);
+    const requestedProductId = typeof item.productId === 'string'
+      ? item.productId
+      : null;
+    const productIdentity = requestedProductId || legacyId;
 
-    if (legacyId && seenProducts.has(legacyId)) {
+    if (productIdentity && seenProducts.has(productIdentity)) {
       return res.status(400).json({
         error: `Товар "${item.title}" повторяется в партии`
       });
     }
 
-    if (legacyId) seenProducts.add(legacyId);
+    if (productIdentity) seenProducts.add(productIdentity);
+  }
+
+  if (requestedBatchId) {
+    const existing = await pool.query(
+      'SELECT batch_number AS "batchNumber" FROM purchase_batches WHERE id = $1',
+      [requestedBatchId]
+    ).catch(error => {
+      console.error('Purchase batch duplicate check failed:', error.message);
+      return null;
+    });
+    if (!existing) {
+      return res.status(503).json({ success: false, error: 'Не удалось проверить сохранённые поставки. Повторите позже.' });
+    }
+    if (existing.rows[0]) {
+      return res.status(201).json({ success: true, alreadySaved: true, batchNumber: existing.rows[0].batchNumber });
+    }
   }
 
   const client = await pool.connect();
-  const batchId = randomUUID();
+  const batchId = requestedBatchId || randomUUID();
 
   try {
     await client.query('BEGIN');
@@ -1492,30 +1579,47 @@ app.post('/api/purchase-batches', async (req, res) => {
     const savedItems = [];
 
     for (const item of items) {
-      const productId = randomUUID();
+      const requestedProductId = typeof item.productId === 'string' &&
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(item.productId)
+        ? item.productId
+        : null;
       const legacyId = item.legacyId == null
         ? null
         : String(item.legacyId);
+      const photoForWrite = typeof item.photo === 'string' && item.photo.includes('/api/products/')
+        ? null
+        : item.photo || null;
+      let actualProductId = null;
 
-      const productResult = await client.query(
-        `INSERT INTO products (
-          id, legacy_id, title, photo
-        )
-        VALUES ($1, $2, $3, $4)
-        ON CONFLICT (legacy_id)
-        DO UPDATE SET
-          title = EXCLUDED.title,
-          photo = COALESCE(EXCLUDED.photo, products.photo)
-        RETURNING id`,
-        [
-          productId,
-          legacyId,
-          item.title.trim(),
-          item.photo || null
-        ]
-      );
+      if (requestedProductId) {
+        const existingProduct = await client.query(
+          'SELECT id FROM products WHERE id = $1 FOR UPDATE',
+          [requestedProductId]
+        );
+        if (existingProduct.rows[0]) {
+          await client.query(
+            `UPDATE products SET title = $2, photo = COALESCE($3, photo), is_active = TRUE
+             WHERE id = $1`,
+            [requestedProductId, item.title.trim(), photoForWrite]
+          );
+          actualProductId = requestedProductId;
+        }
+      }
 
-      const actualProductId = productResult.rows[0].id;
+      if (!actualProductId) {
+        const productResult = await client.query(
+          `INSERT INTO products (id, legacy_id, title, photo)
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT (legacy_id)
+           DO UPDATE SET
+             title = EXCLUDED.title,
+             photo = COALESCE(EXCLUDED.photo, products.photo),
+             is_active = TRUE
+           RETURNING id`,
+          [randomUUID(), legacyId, item.title.trim(), photoForWrite]
+        );
+        actualProductId = productResult.rows[0].id;
+      }
       const batchItemId = randomUUID();
 
       const quantity = Number(item.quantity);
@@ -1619,9 +1723,19 @@ app.post('/api/purchase-batches', async (req, res) => {
     });
 
   } catch (error) {
-    await client.query('ROLLBACK');
+    await client.query('ROLLBACK').catch(() => {});
 
     console.error('Purchase batch creation error:', error.message);
+
+    if (requestedBatchId && error.code === '23505') {
+      const existing = await pool.query(
+        'SELECT batch_number AS "batchNumber" FROM purchase_batches WHERE id = $1',
+        [requestedBatchId]
+      ).catch(() => ({ rows: [] }));
+      if (existing.rows[0]) {
+        return res.status(201).json({ success: true, alreadySaved: true, batchNumber: existing.rows[0].batchNumber });
+      }
+    }
 
     return res.status(500).json({
       error: 'Не удалось сохранить закупочную партию'
@@ -1634,6 +1748,7 @@ app.post('/api/purchase-batches', async (req, res) => {
 
 app.post('/api/orders', async (req, res) => {
   const {
+    requestId,
     courierName,
     courierChatId,
     clientPhone,
@@ -1647,9 +1762,19 @@ app.post('/api/orders', async (req, res) => {
     items
   } = req.body;
 
+  const requestedOrderId = typeof requestId === 'string' &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(requestId)
+    ? requestId
+    : null;
+  if (requestId != null && !requestedOrderId) {
+    return res.status(400).json({ success: false, error: 'Некорректный идентификатор запроса' });
+  }
+
   if (
     typeof courierName !== 'string' ||
     !courierName.trim() ||
+    typeof clientAddress !== 'string' ||
+    clientAddress.trim().length < 5 ||
     !Array.isArray(items) ||
     items.length === 0 ||
     items.length > 100
@@ -1659,11 +1784,34 @@ app.post('/api/orders', async (req, res) => {
     });
   }
 
+  if (requestedOrderId) {
+    try {
+      const existing = await pool.query(
+        'SELECT id, public_number AS "publicNumber", status FROM orders WHERE id = $1',
+        [requestedOrderId]
+      );
+      if (existing.rows[0]) {
+        return res.status(201).json({
+          success: true,
+          alreadySaved: true,
+          orderId: existing.rows[0].id,
+          publicNumber: existing.rows[0].publicNumber,
+          status: existing.rows[0].status,
+          pushSent: 0,
+          pushWarning: 'Этот заказ уже сохранён. Повторный заказ не создан.'
+        });
+      }
+    } catch (error) {
+      console.error('Order duplicate check failed:', error.message);
+      return res.status(503).json({ success: false, error: 'Не удалось проверить сохранённые заказы. Повторите позже.' });
+    }
+  }
+
   const resolveAddress = async (address) => {
     const query = /душанбе|dushanbe/i.test(address) ? address : address + ', Душанбе, Таджикистан';
     const url = new URL('/api/', GEOCODER_BASE_URL);
     url.searchParams.set('q', query); url.searchParams.set('limit', '1'); url.searchParams.set('lang', 'ru');
-    const response = await fetch(url, { headers: { Accept: 'application/json', 'User-Agent': 'ZudGo-MekhaShop/1.0' }, signal: AbortSignal.timeout(12000) });
+    const response = await fetch(url, { headers: { Accept: 'application/json', 'User-Agent': 'ZudGo-MekhaShop/1.0' }, signal: AbortSignal.timeout(5000) });
     if (!response.ok) throw new Error('Geocoder HTTP ' + response.status);
     const data = await response.json();
     const feature = (data.features || []).find((item) => {
@@ -1678,6 +1826,7 @@ app.post('/api/orders', async (req, res) => {
   let resolvedClientLongitude = clientLongitude == null ? null : Number(clientLongitude);
   let resolvedStoreLatitude = storeLatitude == null ? null : Number(storeLatitude);
   let resolvedStoreLongitude = storeLongitude == null ? null : Number(storeLongitude);
+  let coordinateWarning = null;
   try {
     if ((resolvedClientLatitude == null || resolvedClientLongitude == null) && clientAddress) {
       const point = await resolveAddress(clientAddress); resolvedClientLatitude = point.latitude; resolvedClientLongitude = point.longitude;
@@ -1686,10 +1835,20 @@ app.post('/api/orders', async (req, res) => {
       const point = await resolveAddress(storeAddress); resolvedStoreLatitude = point.latitude; resolvedStoreLongitude = point.longitude;
     }
   } catch (error) {
-    return res.status(422).json({ success: false, error: error.message || 'Не удалось преобразовать адреса в координаты.' });
+    if (resolvedStoreLatitude == null || resolvedStoreLongitude == null) {
+      return res.status(422).json({ success: false, error: error.message || 'Не удалось определить геопозицию магазина.' });
+    }
+    resolvedClientLatitude = null;
+    resolvedClientLongitude = null;
+    coordinateWarning = 'Точка клиента не определилась; курьеру передан текстовый адрес.';
   }
-  if (resolvedClientLatitude == null || resolvedClientLongitude == null || resolvedStoreLatitude == null || resolvedStoreLongitude == null) {
-    return res.status(400).json({ success: false, error: 'Укажите адрес клиента и адрес магазина.' });
+  if (resolvedStoreLatitude == null || resolvedStoreLongitude == null) {
+    return res.status(400).json({ success: false, error: 'Укажите адрес клиента и включите геопозицию магазина.' });
+  }
+  if ((resolvedClientLatitude == null) !== (resolvedClientLongitude == null)) {
+    resolvedClientLatitude = null;
+    resolvedClientLongitude = null;
+    coordinateWarning = 'Точка клиента не определилась; курьеру передан текстовый адрес.';
   }
 
   const hasLatitude = resolvedClientLatitude !== undefined && resolvedClientLatitude !== null;
@@ -1750,7 +1909,7 @@ app.post('/api/orders', async (req, res) => {
 
   
 const client = await pool.connect();
-const orderId = randomUUID();
+const orderId = requestedOrderId || randomUUID();
 let publicNumber;
 
 try {
@@ -1827,8 +1986,26 @@ try {
 
     await client.query('COMMIT');
   } catch (error) {
-    await client.query('ROLLBACK');
+    await client.query('ROLLBACK').catch(() => {});
     console.error('Order creation error:', error.message);
+
+    if (requestedOrderId && error.code === '23505') {
+      const existing = await pool.query(
+        'SELECT id, public_number AS "publicNumber", status FROM orders WHERE id = $1',
+        [requestedOrderId]
+      ).catch(() => ({ rows: [] }));
+      if (existing.rows[0]) {
+        return res.status(201).json({
+          success: true,
+          alreadySaved: true,
+          orderId: existing.rows[0].id,
+          publicNumber: existing.rows[0].publicNumber,
+          status: existing.rows[0].status,
+          pushSent: 0,
+          pushWarning: 'Этот заказ уже сохранён. Повторный заказ не создан.'
+        });
+      }
+    }
 
     return res.status(500).json({
       error: 'Не удалось сохранить заказ'
@@ -1863,6 +2040,7 @@ try {
       status: 'pending',
       pushSent: 0,
       pushQueued: firebaseAdminReady,
+      coordinateWarning,
       pushWarning: firebaseAdminReady
         ? 'Заказ сохранён и передан на отправку. ZudGo также получает заказы при синхронизации.'
         : 'Заказ сохранён. Firebase Push недоступен; ZudGo получит заказ при синхронизации.'
