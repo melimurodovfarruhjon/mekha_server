@@ -60,6 +60,52 @@ const pool = new Pool({
   connectionTimeoutMillis: 5000
 });
 
+function queueCourierOrderPush({ orderId, publicNumber, items }) {
+  if (!firebaseAdminReady) return;
+  setImmediate(async () => {
+    try {
+      const devices = await pool.query(
+        'SELECT id, fcm_token FROM courier_test_devices WHERE is_active = TRUE'
+      );
+      if (!devices.rows.length) {
+        console.warn('Order saved; no active ZudGo device registered. Polling remains available.');
+        return;
+      }
+      const title = `Новый заказ №${publicNumber}`;
+      const body = items
+        .map(item => `${item.title} × ${Number(item.qty)}`)
+        .join(', ')
+        .slice(0, 160);
+      const results = await Promise.allSettled(devices.rows.map(async device => {
+        try {
+          await admin.messaging().send({
+            token: device.fcm_token,
+            notification: { title, body: body || 'Новый заказ ожидает вас' },
+            data: { type: 'courier_order', orderId, publicNumber: String(publicNumber) },
+            android: { priority: 'high', notification: { channelId: 'zudgo_orders', sound: 'default' } }
+          });
+        } catch (error) {
+          if (['messaging/registration-token-not-registered', 'messaging/invalid-registration-token'].includes(error.code)) {
+            await pool.query(
+              'UPDATE courier_test_devices SET is_active = FALSE WHERE id = $1',
+              [device.id]
+            );
+          }
+          throw error;
+        }
+      }));
+      const delivered = results.filter(result => result.status === 'fulfilled').length;
+      if (!delivered) {
+        const firstFailure = results.find(result => result.status === 'rejected');
+        throw firstFailure?.reason || new Error('Firebase не принял push ни для одного устройства');
+      }
+      console.log(`Courier order ${publicNumber}: push sent to ${delivered} device(s)`);
+    } catch (error) {
+      console.error(`Courier push for order ${publicNumber} failed:`, error.message);
+    }
+  });
+}
+
 async function initializeDatabase() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS orders (
@@ -100,6 +146,7 @@ async function initializeDatabase() {
 
     ALTER TABLE orders ADD COLUMN IF NOT EXISTS store_address TEXT;
     ALTER TABLE orders
+      ADD COLUMN IF NOT EXISTS accepted_at TIMESTAMPTZ,
       ADD COLUMN IF NOT EXISTS picked_up_at TIMESTAMPTZ,
       ADD COLUMN IF NOT EXISTS delivered_at TIMESTAMPTZ,
       ADD COLUMN IF NOT EXISTS pickup_confirmed_by TEXT;
@@ -137,12 +184,16 @@ CREATE TABLE IF NOT EXISTS order_events (
   id BIGSERIAL PRIMARY KEY,
   order_id UUID NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
   event_type TEXT NOT NULL CHECK (
-    event_type IN ('DELIVERED', 'RETURN')
+    event_type IN ('ACCEPTED', 'DELIVERED', 'RETURN')
   ),
   reason TEXT,
   telegram_callback_id TEXT UNIQUE,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE order_events DROP CONSTRAINT IF EXISTS order_events_event_type_check;
+ALTER TABLE order_events ADD CONSTRAINT order_events_event_type_check
+  CHECK (event_type IN ('ACCEPTED', 'DELIVERED', 'RETURN'));
 
 ALTER TABLE order_events
 ADD COLUMN IF NOT EXISTS frontend_processed_at TIMESTAMPTZ;
@@ -510,7 +561,7 @@ app.get('/api/courier/test-device/orders', async (req, res) => {
       o.client_phone AS "clientPhone", o.client_address AS "clientAddress",
       o.client_latitude AS "clientLatitude", o.client_longitude AS "clientLongitude",
       o.store_address AS "storeAddress", o.store_latitude AS "storeLatitude", o.store_longitude AS "storeLongitude",
-      o.comment, o.status, o.created_at AS "createdAt",
+      o.comment, o.status, o.accepted_at AS "acceptedAt", o.created_at AS "createdAt",
       COALESCE(json_agg(json_build_object('title', oi.title, 'quantity', oi.quantity, 'photo', oi.photo)
       ORDER BY oi.id) FILTER (WHERE oi.id IS NOT NULL), '[]'::json) AS items
       FROM orders o LEFT JOIN order_items oi ON oi.order_id = o.id
@@ -520,6 +571,64 @@ app.get('/api/courier/test-device/orders', async (req, res) => {
   } catch (error) {
     console.error('Test device orders fetch failed:', error.message);
     return res.status(500).json({ success: false, error: 'Не удалось загрузить заказы' });
+  }
+});
+
+app.post('/api/courier/test-device/orders/:id/accept', async (req, res) => {
+  const authorization = req.get('authorization') || '';
+  const fcmToken = authorization.startsWith('Bearer ') ? authorization.slice(7) : '';
+  if (!fcmToken || fcmToken.length > 4096) {
+    return res.status(401).json({ success: false, error: 'Требуется токен устройства' });
+  }
+
+  const client = await pool.connect();
+  try {
+    const tokenHash = createHash('sha256').update(fcmToken, 'utf8').digest('hex');
+    const device = await client.query(
+      'SELECT id FROM courier_test_devices WHERE token_hash = $1 AND is_active = TRUE LIMIT 1',
+      [tokenHash]
+    );
+    if (!device.rows[0]) {
+      return res.status(401).json({ success: false, error: 'Устройство не зарегистрировано' });
+    }
+
+    await client.query('BEGIN');
+    const updated = await client.query(
+      `UPDATE orders
+       SET accepted_at = NOW(), updated_at = NOW()
+       WHERE id = $1 AND courier_chat_id = 'zudgo-test-device'
+         AND status = 'pending' AND accepted_at IS NULL
+       RETURNING id, public_number AS "publicNumber", accepted_at AS "acceptedAt"`,
+      [req.params.id]
+    );
+
+    if (updated.rows[0]) {
+      await client.query(
+        `INSERT INTO order_events (order_id, event_type) VALUES ($1, 'ACCEPTED')`,
+        [updated.rows[0].id]
+      );
+      await client.query('COMMIT');
+      return res.json({ success: true, order: updated.rows[0] });
+    }
+
+    await client.query('ROLLBACK');
+    const existing = await client.query(
+      `SELECT id, public_number AS "publicNumber", accepted_at AS "acceptedAt"
+       FROM orders
+       WHERE id = $1 AND courier_chat_id = 'zudgo-test-device'
+         AND status = 'pending' AND accepted_at IS NOT NULL`,
+      [req.params.id]
+    );
+    if (existing.rows[0]) {
+      return res.json({ success: true, alreadyAccepted: true, order: existing.rows[0] });
+    }
+    return res.status(409).json({ success: false, error: 'Заказ уже изменён или недоступен.' });
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('Test-device order acceptance failed:', error.message);
+    return res.status(500).json({ success: false, error: 'Не удалось принять заказ' });
+  } finally {
+    client.release();
   }
 });
 
@@ -1646,6 +1755,8 @@ let publicNumber;
 
 try {
   await client.query('BEGIN');
+  await client.query("SET LOCAL lock_timeout = '10s'");
+  await client.query("SET LOCAL statement_timeout = '20s'");
 
   // Не допускаем одновременную выдачу одинаковых номеров
   await client.query(
@@ -1740,44 +1851,22 @@ try {
     `Пожалуйста, подтвердите статус кнопкой ниже.`;
 
   if (!courierChatId) {
-    if (!firebaseAdminReady) {
+    if (firebaseAdminReady) {
+      queueCourierOrderPush({ orderId, publicNumber, items });
+    } else {
       console.warn('Order saved; Firebase Admin SDK is not configured. Courier polling remains available.');
-      return res.status(201).json({ success: true, orderId, publicNumber, status: 'pending',
-        pushSent: 0, pushWarning: 'Заказ сохранён, но Push пока недоступен: Firebase Admin SDK не настроен на сервере. ZudGo получит заказ при синхронизации.' });
     }
-    try {
-      const devices = await pool.query('SELECT id, fcm_token FROM courier_test_devices WHERE is_active = TRUE');
-      if (!devices.rows.length) {
-        console.warn('Order saved; no active ZudGo test device registered. Polling can still deliver it.');
-        return res.status(201).json({ success: true, orderId, publicNumber, status: 'pending',
-          pushSent: 0, pushWarning: 'Устройство пока не зарегистрировано для Push. Заказ сохранён и будет доступен приложению при синхронизации.' });
-      }
-      const title = `Новый заказ №${publicNumber}`;
-      const body = items.map(item => `${item.title} × ${Number(item.qty)}`).join(', ').slice(0, 160);
-      const results = await Promise.allSettled(devices.rows.map(async device => {
-        try {
-          await admin.messaging().send({
-            token: device.fcm_token,
-            notification: { title, body: body || 'Новый заказ ожидает вас' },
-            data: { type: 'courier_order', orderId, publicNumber: String(publicNumber) },
-            android: { priority: 'high', notification: { channelId: 'zudgo_orders', sound: 'default' } }
-          });
-        } catch (error) {
-          if (['messaging/registration-token-not-registered', 'messaging/invalid-registration-token'].includes(error.code)) {
-            await pool.query('UPDATE courier_test_devices SET is_active = FALSE WHERE id = $1', [device.id]);
-          }
-          throw error;
-        }
-      }));
-      const delivered = results.filter(result => result.status === 'fulfilled').length;
-      if (!delivered) throw new Error('Firebase не принял push ни для одного устройства');
-      return res.status(201).json({ success: true, orderId, publicNumber, status: 'pending',
-        pushSent: delivered, message: 'Заказ отправлен в ZudGo' });
-    } catch (error) {
-      console.error('FCM courier push failed:', error.message);
-      return res.status(201).json({ success: true, orderId, publicNumber, status: 'pending',
-        pushSent: 0, pushWarning: 'Заказ сохранён. Push не доставлен: ' + error.message });
-    }
+    return res.status(201).json({
+      success: true,
+      orderId,
+      publicNumber,
+      status: 'pending',
+      pushSent: 0,
+      pushQueued: firebaseAdminReady,
+      pushWarning: firebaseAdminReady
+        ? 'Заказ сохранён и передан на отправку. ZudGo также получает заказы при синхронизации.'
+        : 'Заказ сохранён. Firebase Push недоступен; ZudGo получит заказ при синхронизации.'
+    });
   }
 
   try {
