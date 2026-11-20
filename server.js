@@ -1808,47 +1808,79 @@ app.post('/api/orders', async (req, res) => {
   }
 
   const resolveAddress = async (address) => {
-    const query = /душанбе|dushanbe/i.test(address) ? address : address + ', Душанбе, Таджикистан';
+    const cleanAddress = String(address || '').trim();
+    if (!cleanAddress) throw new Error('Адрес не указан');
+    const query = /душанбе|dushanbe/i.test(cleanAddress)
+      ? cleanAddress
+      : cleanAddress + ', Душанбе, Таджикистан';
     const url = new URL('/api/', GEOCODER_BASE_URL);
-    url.searchParams.set('q', query); url.searchParams.set('limit', '1'); url.searchParams.set('lang', 'ru');
-    const response = await fetch(url, { headers: { Accept: 'application/json', 'User-Agent': 'ZudGo-MekhaShop/1.0' }, signal: AbortSignal.timeout(5000) });
-    if (!response.ok) throw new Error('Geocoder HTTP ' + response.status);
-    const data = await response.json();
-    const feature = (data.features || []).find((item) => {
-      const coords = item.geometry && item.geometry.coordinates ? item.geometry.coordinates : [];
-      const longitude = Number(coords[0]), latitude = Number(coords[1]);
-      return Number.isFinite(latitude) && Number.isFinite(longitude) && latitude >= 38.40 && latitude <= 38.75 && longitude >= 68.55 && longitude <= 69.05;
+    url.searchParams.set('q', query);
+    url.searchParams.set('limit', '5');
+    url.searchParams.set('lang', 'ru');
+    // Bias ambiguous landmarks (for example, "цирк") toward Dushanbe.
+    url.searchParams.set('lat', '38.56');
+    url.searchParams.set('lon', '68.78');
+    const response = await fetch(url, {
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': 'ZudGo-MekhaShop/1.0'
+      },
+      signal: AbortSignal.timeout(8000)
     });
-    if (!feature) throw new Error('Не удалось определить координаты адреса: ' + address);
-    return { latitude: Number(feature.geometry.coordinates[1]), longitude: Number(feature.geometry.coordinates[0]) };
+    if (!response.ok) throw new Error('Сервис поиска адресов временно недоступен');
+    const data = await response.json();
+    const features = Array.isArray(data.features) ? data.features : [];
+    const feature = features.find((item) => {
+      const coords = item.geometry?.coordinates || [];
+      const longitude = Number(coords[0]);
+      const latitude = Number(coords[1]);
+      return Number.isFinite(latitude) &&
+        Number.isFinite(longitude) &&
+        latitude >= 38.40 && latitude <= 38.75 &&
+        longitude >= 68.55 && longitude <= 69.05;
+    });
+    if (!feature) {
+      throw new Error('Не удалось найти адрес «' + cleanAddress + '» в Душанбе. Уточните улицу или ориентир.');
+    }
+    return {
+      latitude: Number(feature.geometry.coordinates[1]),
+      longitude: Number(feature.geometry.coordinates[0])
+    };
   };
+
   let resolvedClientLatitude = clientLatitude == null ? null : Number(clientLatitude);
   let resolvedClientLongitude = clientLongitude == null ? null : Number(clientLongitude);
   let resolvedStoreLatitude = storeLatitude == null ? null : Number(storeLatitude);
   let resolvedStoreLongitude = storeLongitude == null ? null : Number(storeLongitude);
-  let coordinateWarning = null;
-  try {
-    if ((resolvedClientLatitude == null || resolvedClientLongitude == null) && clientAddress) {
-      const point = await resolveAddress(clientAddress); resolvedClientLatitude = point.latitude; resolvedClientLongitude = point.longitude;
+
+  if (resolvedClientLatitude == null || resolvedClientLongitude == null) {
+    try {
+      const point = await resolveAddress(clientAddress);
+      resolvedClientLatitude = point.latitude;
+      resolvedClientLongitude = point.longitude;
+    } catch (error) {
+      return res.status(422).json({
+        success: false,
+        error: error.message || 'Не удалось определить адрес клиента.'
+      });
     }
-    if ((resolvedStoreLatitude == null || resolvedStoreLongitude == null) && storeAddress) {
-      const point = await resolveAddress(storeAddress); resolvedStoreLatitude = point.latitude; resolvedStoreLongitude = point.longitude;
-    }
-  } catch (error) {
-    if (resolvedStoreLatitude == null || resolvedStoreLongitude == null) {
-      return res.status(422).json({ success: false, error: error.message || 'Не удалось определить геопозицию магазина.' });
-    }
-    resolvedClientLatitude = null;
-    resolvedClientLongitude = null;
-    coordinateWarning = 'Точка клиента не определилась; курьеру передан текстовый адрес.';
   }
+
   if (resolvedStoreLatitude == null || resolvedStoreLongitude == null) {
-    return res.status(400).json({ success: false, error: 'Укажите адрес клиента и включите геопозицию магазина.' });
+    try {
+      const point = await resolveAddress(storeAddress);
+      resolvedStoreLatitude = point.latitude;
+      resolvedStoreLongitude = point.longitude;
+    } catch (error) {
+      return res.status(422).json({
+        success: false,
+        error: error.message || 'Не удалось определить адрес магазина.'
+      });
+    }
   }
+
   if ((resolvedClientLatitude == null) !== (resolvedClientLongitude == null)) {
-    resolvedClientLatitude = null;
-    resolvedClientLongitude = null;
-    coordinateWarning = 'Точка клиента не определилась; курьеру передан текстовый адрес.';
+    return res.status(400).json({ success: false, error: 'Не удалось определить координаты клиента.' });
   }
 
   const hasLatitude = resolvedClientLatitude !== undefined && resolvedClientLatitude !== null;
