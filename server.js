@@ -2072,7 +2072,6 @@ try {
       status: 'pending',
       pushSent: 0,
       pushQueued: firebaseAdminReady,
-      coordinateWarning,
       pushWarning: firebaseAdminReady
         ? 'Заказ сохранён и передан на отправку. ZudGo также получает заказы при синхронизации.'
         : 'Заказ сохранён. Firebase Push недоступен; ZudGo получит заказ при синхронизации.'
