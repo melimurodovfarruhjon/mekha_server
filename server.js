@@ -396,8 +396,8 @@ function allowMapRequest(req, res, next) {
 
 app.get('/api/maps/geocode', allowMapRequest, async (req, res) => {
   const address = typeof req.query.address === 'string' ? req.query.address.trim() : '';
-  if (address.length < 5 || address.length > 300) {
-    return res.status(400).json({ success: false, error: 'Укажите адрес длиной от 5 до 300 символов.' });
+  if (address.length < 2 || address.length > 300) {
+    return res.status(400).json({ success: false, error: 'Укажите адрес, название места или ориентир (от 2 до 300 символов).' });
   }
 
   const query = /душанбе|dushanbe/i.test(address) ? address : `${address}, Душанбе, Таджикистан`;
@@ -1774,7 +1774,7 @@ app.post('/api/orders', async (req, res) => {
     typeof courierName !== 'string' ||
     !courierName.trim() ||
     typeof clientAddress !== 'string' ||
-    clientAddress.trim().length < 5 ||
+    clientAddress.trim().length < 2 ||
     !Array.isArray(items) ||
     items.length === 0 ||
     items.length > 100
